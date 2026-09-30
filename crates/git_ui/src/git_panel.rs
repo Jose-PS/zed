@@ -32,9 +32,9 @@ use git::Oid;
 use git::commit::ParsedCommitMessage;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
-    GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-    Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking, UpstreamTrackingStatus,
-    get_git_committer,
+    GitCommitTemplate, GitCommitter, InProgressOperation, InitialGraphCommitData, LogOrder,
+    LogSource, PushOptions, Remote, RemoteCommandOutput, ResetMode, Upstream, UpstreamTracking,
+    UpstreamTrackingStatus, get_git_committer,
 };
 use git::stash::GitStash;
 use git::status::{DiffStat, StageStatus};
@@ -3356,6 +3356,29 @@ impl GitPanel {
         .detach();
     }
 
+    pub fn abort_operation(
+        &mut self,
+        _: &git::AbortOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        crate::merge_operations::abort_in_progress_operation(
+            self.workspace.clone(),
+            active_repository,
+            window,
+            cx,
+        );
+    }
+
+    fn in_progress_operation(&self, cx: &App) -> Option<InProgressOperation> {
+        self.active_repository
+            .as_ref()
+            .and_then(|repository| repository.read(cx).merge.in_progress)
+    }
+
     pub fn stash_apply(&mut self, _: &StashApply, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
@@ -6341,11 +6364,21 @@ impl GitPanel {
         } else if !self.has_write_access(cx) {
             (false, "You do not have write access to this project")
         } else {
-            (true, self.commit_button_title())
+            (true, self.commit_button_title(cx))
         }
     }
 
-    pub fn commit_button_title(&self) -> &'static str {
+    pub fn commit_button_title(&self, cx: &App) -> &'static str {
+        if !self.amend_pending
+            && let Some(operation) = self.in_progress_operation(cx)
+        {
+            return match operation {
+                InProgressOperation::Merge => "Commit Merge",
+                InProgressOperation::CherryPick => "Commit Cherry-pick",
+                InProgressOperation::Revert => "Commit Revert",
+                InProgressOperation::Rebase => "Commit",
+            };
+        }
         if self.amend_pending {
             if self.has_staged_changes() {
                 "Amend"
@@ -6748,6 +6781,7 @@ impl GitPanel {
                                 h_flex()
                                     .gap_0p5()
                                     .children(enable_coauthors)
+                                    .children(self.render_abort_operation_button(cx))
                                     .child(self.render_commit_button(cx)),
                             ),
                     ),
@@ -6756,9 +6790,32 @@ impl GitPanel {
         Some(footer)
     }
 
+    fn render_abort_operation_button(&self, cx: &App) -> Option<AnyElement> {
+        let operation = self.in_progress_operation(cx)?;
+        let label = crate::merge_operations::in_progress_operation_label(operation);
+        let focus_handle = self.focus_handle.clone();
+        Some(
+            Button::new("abort-operation", format!("Abort {label}"))
+                .size(ButtonSize::Compact)
+                .label_size(LabelSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in(
+                        format!("git {} --abort", operation.subcommand()),
+                        &git::AbortOperation,
+                        &focus_handle,
+                        cx,
+                    )
+                })
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(git::AbortOperation.boxed_clone(), cx);
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (can_commit, tooltip) = self.configure_commit_button(cx);
-        let title = self.commit_button_title();
+        let title = self.commit_button_title(cx);
         let commit_tooltip_focus_handle = self.commit_editor.focus_handle(cx);
         let options = self.commit_options();
         let amend = options.amend;
@@ -11169,6 +11226,63 @@ mod tests {
                 ],
             );
             assert_eq!(panel.entry_count, 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_in_progress_merge_changes_commit_title_and_can_be_aborted(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "staged.rs": "staged content",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("staged.rs", FileStatus::index(StatusCode::Modified))],
+        );
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.insert("MERGE_HEAD".into(), "merge-sha".into());
+        })
+        .unwrap();
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        await_git_panel_entries(&panel, &mut cx).await;
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.commit_button_title(cx), "Commit Merge");
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.abort_operation(&git::AbortOperation, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Abort");
+        cx.run_until_parked();
+
+        let merge_head = fs
+            .with_git_state(path!("/project/.git").as_ref(), false, |state| {
+                state.refs.get("MERGE_HEAD").cloned()
+            })
+            .unwrap();
+        assert_eq!(merge_head, None);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.commit_button_title(cx), "Commit");
         });
     }
 

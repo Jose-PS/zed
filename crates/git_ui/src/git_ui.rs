@@ -280,6 +280,14 @@ pub fn init(cx: &mut App) {
                 panel.stash_pop(action, window, cx);
             });
         });
+        workspace.register_action(|workspace, action: &git::AbortOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.abort_operation(action, window, cx);
+            });
+        });
         workspace.register_action(|workspace, action: &git::StashApply, window, cx| {
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;

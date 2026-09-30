@@ -1,7 +1,7 @@
 use askpass::AskPassDelegate;
-use git::repository::CherryPickOutcome;
+use git::repository::{CherryPickOutcome, InProgressOperation};
 use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
-use gpui::{App, Entity, SharedString, WeakEntity, Window};
+use gpui::{App, Entity, PromptLevel, SharedString, WeakEntity, Window};
 use notifications::status_toast::StatusToast;
 use project::git_store::Repository;
 use ui::prelude::*;
@@ -118,6 +118,54 @@ pub(crate) fn cherry_pick_commit(
         });
     })
     .detach();
+}
+
+pub(crate) fn abort_in_progress_operation(
+    workspace: WeakEntity<Workspace>,
+    repository: Entity<Repository>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(operation) = repository.read(cx).snapshot().merge.in_progress else {
+        return;
+    };
+    let subcommand = operation.subcommand();
+    let prompt = window.prompt(
+        PromptLevel::Warning,
+        &format!("Abort the {subcommand} in progress?"),
+        Some("Your working tree will be restored to the state it was in before it started."),
+        &["Abort", "Cancel"],
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if !matches!(prompt.await, Ok(0)) {
+            return;
+        }
+        let receiver = cx.update(|cx| {
+            repository.update(cx, |repository, _| repository.abort_operation(operation))
+        });
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(canceled) => Err(canceled.into()),
+        };
+        if let Err(error) = result {
+            cx.update(|cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    show_error_toast(workspace, format!("{subcommand} --abort"), error, cx);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+pub(crate) fn in_progress_operation_label(operation: InProgressOperation) -> &'static str {
+    match operation {
+        InProgressOperation::Merge => "Merge",
+        InProgressOperation::CherryPick => "Cherry-pick",
+        InProgressOperation::Revert => "Revert",
+        InProgressOperation::Rebase => "Rebase",
+    }
 }
 
 #[cfg(test)]
