@@ -2435,6 +2435,7 @@ impl GitGraph {
                     .into_iter()
                     .map(|tag_name| SharedString::from(tag_name.to_string()))
                     .collect(),
+                is_merge_commit: commit.data.parents.len() > 1,
             },
             CommitContextMenuSource::GitGraph,
             ref_name,

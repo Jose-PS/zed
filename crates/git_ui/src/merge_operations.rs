@@ -1,0 +1,142 @@
+use askpass::AskPassDelegate;
+use git::repository::CherryPickOutcome;
+use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
+use gpui::{App, Entity, SharedString, WeakEntity, Window};
+use notifications::status_toast::StatusToast;
+use project::git_store::Repository;
+use ui::prelude::*;
+use workspace::Workspace;
+
+fn operation_askpass_delegate(
+    workspace: WeakEntity<Workspace>,
+    operation: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AskPassDelegate {
+    let operation = operation.into();
+    let window = window.window_handle();
+    AskPassDelegate::new_with_cancellation(
+        &mut cx.to_async(),
+        move |prompt, tx, cancellation, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            AskPassModal::new(
+                                operation.clone(),
+                                prompt.into(),
+                                tx,
+                                cancellation,
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                })
+                .ok();
+        },
+    )
+}
+
+fn show_operation_toast(
+    workspace: &WeakEntity<Workspace>,
+    message: String,
+    has_conflicts: bool,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        let toast = StatusToast::new(message, cx, |this, _cx| {
+            let (icon, color) = if has_conflicts {
+                (IconName::Warning, Color::Warning)
+            } else {
+                (IconName::GitBranch, Color::Muted)
+            };
+            this.icon(Icon::new(icon).size(IconSize::Small).color(color))
+        });
+        workspace.toggle_status_toast(toast, cx);
+    });
+}
+
+fn current_branch_name(repository: &Entity<Repository>, cx: &App) -> String {
+    repository
+        .read(cx)
+        .branch
+        .as_ref()
+        .map(|branch| branch.name().to_string())
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+pub(crate) fn cherry_pick_message(
+    outcome: CherryPickOutcome,
+    short_sha: &str,
+    current_branch: &str,
+) -> String {
+    match outcome {
+        CherryPickOutcome::Applied => format!("Cherry-picked {short_sha} into {current_branch}"),
+        CherryPickOutcome::AlreadyApplied => {
+            format!("{short_sha} is already in {current_branch}")
+        }
+        CherryPickOutcome::Conflicts => {
+            format!("Cherry-picking {short_sha} has conflicts. Resolve them and commit to finish")
+        }
+    }
+}
+
+pub(crate) fn cherry_pick_commit(
+    workspace: WeakEntity<Workspace>,
+    repository: Entity<Repository>,
+    sha: String,
+    short_sha: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let askpass = operation_askpass_delegate(workspace.clone(), "git cherry-pick", window, cx);
+    let current_branch = current_branch_name(&repository, cx);
+    let receiver = repository.update(cx, |repository, cx| {
+        repository.cherry_pick(sha, askpass, cx)
+    });
+    cx.spawn(async move |cx| {
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(canceled) => Err(canceled.into()),
+        };
+        cx.update(|cx| match result {
+            Ok(outcome) => show_operation_toast(
+                &workspace,
+                cherry_pick_message(outcome, &short_sha, &current_branch),
+                outcome == CherryPickOutcome::Conflicts,
+                cx,
+            ),
+            Err(error) => {
+                if let Some(workspace) = workspace.upgrade() {
+                    show_error_toast(workspace, "cherry-pick", error, cx);
+                }
+            }
+        });
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cherry_pick_message() {
+        assert_eq!(
+            cherry_pick_message(CherryPickOutcome::Applied, "abc1234", "main"),
+            "Cherry-picked abc1234 into main"
+        );
+        assert_eq!(
+            cherry_pick_message(CherryPickOutcome::AlreadyApplied, "abc1234", "main"),
+            "abc1234 is already in main"
+        );
+        assert_eq!(
+            cherry_pick_message(CherryPickOutcome::Conflicts, "abc1234", "main"),
+            "Cherry-picking abc1234 has conflicts. Resolve them and commit to finish"
+        );
+    }
+}

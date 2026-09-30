@@ -1187,6 +1187,7 @@ struct BulkStaging {
 struct CommitHistoryEntry {
     sha: Oid,
     tag_names: Vec<SharedString>,
+    is_merge_commit: bool,
 }
 
 impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
@@ -1198,6 +1199,7 @@ impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
                 .into_iter()
                 .map(|tag_name| SharedString::from(tag_name.to_string()))
                 .collect(),
+            is_merge_commit: commit.parents.len() > 1,
         }
     }
 }
@@ -7141,6 +7143,7 @@ impl GitPanel {
             CommitContextMenuData {
                 sha: commit.sha,
                 tag_names: commit.tag_names,
+                is_merge_commit: commit.is_merge_commit,
             },
             CommitContextMenuSource::GitPanel,
             None,
@@ -10465,6 +10468,7 @@ mod tests {
                 CommitHistory::Loaded(Rc::from([CommitHistoryEntry {
                     sha,
                     tag_names: Vec::new(),
+                    is_merge_commit: false,
                 }]))
             );
         });
@@ -10521,6 +10525,7 @@ mod tests {
         let entries: Rc<[CommitHistoryEntry]> = Rc::from([CommitHistoryEntry {
             sha,
             tag_names: Vec::new(),
+            is_merge_commit: false,
         }]);
         let no_entries: Rc<[CommitHistoryEntry]> = Rc::from([]);
 
