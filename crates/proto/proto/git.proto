@@ -146,6 +146,14 @@ message UpdateRepository {
   optional string repository_dir_abs_path = 19;
   optional string common_dir_abs_path = 20;
   optional string branch_list_error = 21;
+  optional GitInProgressOperation in_progress_operation = 22;
+}
+
+enum GitInProgressOperation {
+  Merge = 0;
+  CherryPick = 1;
+  Revert = 2;
+  Rebase = 3;
 }
 
 message RemoveRepository {

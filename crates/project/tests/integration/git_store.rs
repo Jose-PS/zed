@@ -5,7 +5,7 @@ mod conflict_set_tests {
 
     use fs::FakeFs;
     use git::{
-        repository::{RepoPath, repo_path},
+        repository::{InProgressOperation, RepoPath, repo_path},
         status::{UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::{BackgroundExecutor, TestAppContext};
@@ -666,6 +666,57 @@ mod conflict_set_tests {
             assert!(!conflict_set.has_conflict);
             assert_eq!(conflict_set.snapshot.conflicts.len(), 0);
         });
+    }
+
+    #[gpui::test]
+    async fn test_in_progress_operation_follows_operation_heads(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        zlog::init_test();
+        cx.update(|cx| {
+            settings::init(cx);
+        });
+        let fs = FakeFs::new(executor);
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project should have an active repository");
+        let in_progress = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress)
+        };
+        assert_eq!(in_progress(cx), None);
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.insert("CHERRY_PICK_HEAD".into(), "abc".into());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), Some(InProgressOperation::CherryPick));
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.remove("CHERRY_PICK_HEAD");
+            state.refs.insert("MERGE_HEAD".into(), "def".into());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), Some(InProgressOperation::Merge));
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.remove("MERGE_HEAD");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), None);
     }
 }
 

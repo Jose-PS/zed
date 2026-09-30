@@ -39,10 +39,10 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
-        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InProgressOperation,
+        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -589,6 +589,7 @@ pub struct RepositoryId(pub u64);
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
     pub message: Option<SharedString>,
+    pub in_progress: Option<InProgressOperation>,
 }
 
 #[derive(Clone)]
@@ -6157,6 +6158,7 @@ impl RepositorySnapshot {
                 .map(|(repo_path, _)| repo_path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            in_progress_operation: self.merge.in_progress.map(in_progress_operation_to_proto),
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6244,6 +6246,7 @@ impl RepositorySnapshot {
                 .map(|(path, _)| path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            in_progress_operation: self.merge.in_progress.map(in_progress_operation_to_proto),
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6424,6 +6427,18 @@ impl MergeDetails {
             .map(|opt| opt.map(SharedString::from))
             .collect::<Vec<_>>();
 
+        let in_progress = [
+            InProgressOperation::Merge,
+            InProgressOperation::CherryPick,
+            InProgressOperation::Rebase,
+            InProgressOperation::Revert,
+        ]
+        .into_iter()
+        .zip(heads.iter())
+        .find_map(|(operation, head)| head.is_some().then_some(operation));
+        let in_progress_changed = self.in_progress != in_progress;
+        self.in_progress = in_progress;
+
         let mut conflicts_changed = false;
 
         // Record the merge state for newly conflicted paths
@@ -6447,7 +6462,7 @@ impl MergeDetails {
                 keep
             });
 
-        conflicts_changed
+        conflicts_changed || in_progress_changed
     }
 }
 
@@ -9990,6 +10005,13 @@ impl Repository {
             self.snapshot.merge.merge_heads_by_conflicted_path != new_merge_heads;
         self.snapshot.merge.merge_heads_by_conflicted_path = new_merge_heads;
         self.snapshot.merge.message = update.merge_message.map(SharedString::from);
+        let new_in_progress = update
+            .in_progress_operation
+            .and_then(|operation| proto::GitInProgressOperation::try_from(operation).ok())
+            .map(in_progress_operation_from_proto);
+        let conflicts_changed =
+            conflicts_changed || self.snapshot.merge.in_progress != new_in_progress;
+        self.snapshot.merge.in_progress = new_in_progress;
         let new_stash_entries = GitStash {
             entries: update
                 .stash_entries
@@ -11146,6 +11168,26 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         proto::git_log_source::Source::Path(path) => {
             Ok(LogSource::Path(RepoPath::from_proto(&path)?))
         }
+    }
+}
+
+fn in_progress_operation_to_proto(operation: InProgressOperation) -> i32 {
+    match operation {
+        InProgressOperation::Merge => proto::GitInProgressOperation::Merge as i32,
+        InProgressOperation::CherryPick => proto::GitInProgressOperation::CherryPick as i32,
+        InProgressOperation::Revert => proto::GitInProgressOperation::Revert as i32,
+        InProgressOperation::Rebase => proto::GitInProgressOperation::Rebase as i32,
+    }
+}
+
+fn in_progress_operation_from_proto(
+    operation: proto::GitInProgressOperation,
+) -> InProgressOperation {
+    match operation {
+        proto::GitInProgressOperation::Merge => InProgressOperation::Merge,
+        proto::GitInProgressOperation::CherryPick => InProgressOperation::CherryPick,
+        proto::GitInProgressOperation::Revert => InProgressOperation::Revert,
+        proto::GitInProgressOperation::Rebase => InProgressOperation::Rebase,
     }
 }
 
