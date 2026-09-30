@@ -79,6 +79,7 @@ pub struct FakeGitRepositoryState {
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
+    pub graph_commits_by_branch: HashMap<String, Vec<Arc<InitialGraphCommitData>>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
@@ -110,6 +111,7 @@ impl FakeGitRepositoryState {
             oids: Default::default(),
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
+            graph_commits_by_branch: HashMap::default(),
             commit_data: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
@@ -1704,7 +1706,7 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1713,8 +1715,14 @@ impl GitRepository for FakeGitRepository {
         async move {
             let (graph_commits, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
+                    let branch_commits = match &log_source {
+                        LogSource::Branch(branch) => {
+                            state.graph_commits_by_branch.get(branch.as_ref()).cloned()
+                        }
+                        LogSource::All | LogSource::Sha(_) | LogSource::Path(_) => None,
+                    };
                     (
-                        state.graph_commits.clone(),
+                        branch_commits.unwrap_or_else(|| state.graph_commits.clone()),
                         state.simulated_graph_error.clone(),
                     )
                 })?;

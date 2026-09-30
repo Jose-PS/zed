@@ -1168,6 +1168,7 @@ pub struct GitPanel {
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
+    history_branch: Option<Branch>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1484,6 +1485,7 @@ impl GitPanel {
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
+                history_branch: None,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -5199,6 +5201,7 @@ impl GitPanel {
             }
             self.git_access = None;
             self._repo_subscriptions.clear();
+            self.history_branch = None;
             if self.active_tab == GitPanelTab::History {
                 self.set_commit_history(CommitHistory::Loading, cx);
             }
@@ -7093,26 +7096,171 @@ impl GitPanel {
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
-            match &self.commit_history {
-                _ if !has_repo => {
-                    this.child(Self::render_history_placeholder("No repository found"))
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .children(self.render_history_header(cx))
+            .map(|this| {
+                let has_repo = self.active_repository.is_some();
+                match &self.commit_history {
+                    _ if !has_repo => {
+                        this.child(Self::render_history_placeholder("No repository found"))
+                    }
+                    CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
+                        "Failed to load commit history",
+                    )),
+                    CommitHistory::Loading => {
+                        this.child(Self::render_history_placeholder("Loading Commit History…"))
+                    }
+                    CommitHistory::Loaded(entries) if entries.is_empty() => {
+                        this.child(Self::render_history_placeholder("No commits yet"))
+                    }
+                    CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
+                        Some(history) => this.child(history),
+                        None => {
+                            this.child(Self::render_history_placeholder("Failed to load commits"))
+                        }
+                    },
                 }
-                CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
-                    "Failed to load commit history",
-                )),
-                CommitHistory::Loading => {
-                    this.child(Self::render_history_placeholder("Loading Commit History…"))
-                }
-                CommitHistory::Loaded(entries) if entries.is_empty() => {
-                    this.child(Self::render_history_placeholder("No commits yet"))
-                }
-                CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
-                    Some(history) => this.child(history),
-                    None => this.child(Self::render_history_placeholder("Failed to load commits")),
-                },
-            }
+            })
+    }
+
+    fn render_history_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let active_repository = self.active_repository.clone()?;
+        let current_branch = active_repository.read(cx).branch.clone();
+        let viewed_branch = self
+            .viewed_history_branch(cx)
+            .cloned()
+            .or_else(|| current_branch.clone())?;
+        let is_viewing_other_branch = self.viewed_history_branch(cx).is_some();
+        let workspace = self.workspace.clone();
+        let git_panel = cx.weak_entity();
+        let selected_branch = viewed_branch.ref_name.clone();
+
+        Some(
+            h_flex()
+                .min_h(Tab::container_height(cx))
+                .w_full()
+                .pl_1()
+                .pr_2()
+                .flex_none()
+                .gap_1()
+                .justify_between()
+                .child(
+                    PopoverMenu::new("history-branch-picker")
+                        .menu(move |window, cx| {
+                            let git_panel = git_panel.clone();
+                            let on_select = Arc::new(
+                                move |branch: Branch, _window: &mut Window, cx: &mut App| {
+                                    git_panel
+                                        .update(cx, |git_panel, cx| {
+                                            git_panel.set_history_branch(Some(branch), cx);
+                                        })
+                                        .ok();
+                                },
+                            );
+                            Some(branch_picker::select_popover(
+                                workspace.clone(),
+                                Some(active_repository.clone()),
+                                Some(selected_branch.clone()),
+                                on_select,
+                                window,
+                                cx,
+                            ))
+                        })
+                        .trigger_with_tooltip(
+                            Button::new(
+                                "history-branch",
+                                SharedString::from(viewed_branch.name().to_string()),
+                            )
+                            .label_size(LabelSize::Small)
+                            .start_icon(
+                                Icon::new(IconName::GitBranch)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                            Tooltip::text("Show History of Branch"),
+                        ),
+                )
+                .when_some(
+                    current_branch.filter(|_| is_viewing_other_branch),
+                    |this, current_branch| {
+                        this.child(
+                            IconButton::new("history-current-branch", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(format!(
+                                    "Back to {}",
+                                    current_branch.name()
+                                )))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_history_branch(None, cx);
+                                })),
+                        )
+                    },
+                ),
+        )
+    }
+
+    fn viewed_history_branch<'a>(&'a self, cx: &'a App) -> Option<&'a Branch> {
+        let history_branch = self.history_branch.as_ref()?;
+        let repository = self.active_repository.as_ref()?.read(cx);
+        let is_current_branch = repository
+            .branch
+            .as_ref()
+            .is_some_and(|current_branch| current_branch.ref_name == history_branch.ref_name);
+        let still_exists = repository
+            .branch_list
+            .iter()
+            .any(|branch| branch.ref_name == history_branch.ref_name);
+        (!is_current_branch && still_exists).then_some(history_branch)
+    }
+
+    fn set_history_branch(&mut self, branch: Option<Branch>, cx: &mut Context<Self>) {
+        let branch = branch.filter(|branch| {
+            self.active_repository.as_ref().is_some_and(|repository| {
+                repository
+                    .read(cx)
+                    .branch
+                    .as_ref()
+                    .is_none_or(|current_branch| current_branch.ref_name != branch.ref_name)
+            })
+        });
+        let ref_name_of =
+            |branch: &Option<Branch>| branch.as_ref().map(|branch| branch.ref_name.clone());
+        if ref_name_of(&self.history_branch) == ref_name_of(&branch) {
+            return;
+        }
+        self.history_branch = branch;
+        self.focused_history_entry = None;
+        self.commit_history_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        self.set_commit_history(CommitHistory::Loading, cx);
+        self.preload_commit_history(cx);
+        if self.active_tab == GitPanelTab::History {
+            self.load_commit_history(cx);
+        }
+        cx.notify();
+    }
+
+    fn is_commit_in_current_branch(&self, sha: Oid, cx: &mut Context<Self>) -> bool {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return false;
+        };
+        let Some(log_source) = Self::current_branch_log_source(&active_repository, cx) else {
+            return false;
+        };
+        active_repository.update(cx, |repository, cx| {
+            repository
+                .graph_data(log_source, LogOrder::DateOrder, 0..usize::MAX, cx)
+                .commits
+                .iter()
+                .any(|commit| commit.sha == sha)
         })
     }
 
@@ -7193,16 +7341,22 @@ impl GitPanel {
         let Some(commit) = self.commit_history_entries().get(index).cloned() else {
             return;
         };
-        let Some(repository) = self.active_repository.as_ref() else {
+        let Some(repository) = self.active_repository.clone() else {
             return;
         };
+        let viewing_other_branch = self.viewed_history_branch(cx).is_some();
+        let is_in_current_branch =
+            viewing_other_branch && self.is_commit_in_current_branch(commit.sha, cx);
         let context_menu = commit_context_menu(
             CommitContextMenuData {
                 sha: commit.sha,
                 tag_names: commit.tag_names,
                 is_merge_commit: commit.is_merge_commit,
+                is_in_current_branch,
             },
-            CommitContextMenuSource::GitPanel,
+            CommitContextMenuSource::GitPanel {
+                viewing_other_branch,
+            },
             None,
             self.focus_handle.clone(),
             Some(repository.downgrade()),
@@ -7252,11 +7406,11 @@ impl GitPanel {
     }
 
     fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
+        let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
+        let Some(log_source) = self.commit_history_log_source(cx) else {
             return;
         };
         let log_order = LogOrder::DateOrder;
@@ -7298,7 +7452,7 @@ impl GitPanel {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
+        let Some(log_source) = self.commit_history_log_source(cx) else {
             // No HEAD commit at all (unborn/empty repository).
             self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
@@ -7330,7 +7484,14 @@ impl GitPanel {
         }
     }
 
-    fn commit_history_log_source(
+    fn commit_history_log_source(&self, cx: &App) -> Option<LogSource> {
+        if let Some(branch) = self.viewed_history_branch(cx) {
+            return Some(LogSource::Branch(branch.ref_name.clone()));
+        }
+        Self::current_branch_log_source(self.active_repository.as_ref()?, cx)
+    }
+
+    fn current_branch_log_source(
         active_repository: &Entity<Repository>,
         cx: &App,
     ) -> Option<LogSource> {
@@ -7380,10 +7541,9 @@ impl GitPanel {
             .as_ref()
             .and_then(|context_menu| context_menu.target_entry_index);
 
-        let ahead_count = active_repository
-            .read(cx)
-            .branch
-            .as_ref()
+        let ahead_count = self
+            .viewed_history_branch(cx)
+            .or(active_repository.read(cx).branch.as_ref())
             .and_then(|b| b.upstream.as_ref())
             .and_then(|u| u.tracking.status())
             .map(|s| s.ahead as usize)
@@ -10528,6 +10688,91 @@ mod tests {
                     is_merge_commit: false,
                 }]))
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_history_tab_shows_other_branch_without_checkout(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let main_sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
+        let feature_sha: Oid = "abcdefabcdefabcdefabcdefabcdefabcdefabcd".parse().unwrap();
+        let graph_commit = |sha: Oid| {
+            Arc::new(git::repository::InitialGraphCommitData {
+                sha,
+                parents: SmallVec::new(),
+                ref_names: Vec::new(),
+            })
+        };
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.insert_branches(dot_git, &["main", "feature"]);
+        fs.with_git_state(dot_git, false, |state| {
+            state.refs.insert("HEAD".into(), main_sha.to_string());
+            state.graph_commits = vec![graph_commit(main_sha)];
+            state.graph_commits_by_branch.insert(
+                "refs/heads/feature".into(),
+                vec![graph_commit(feature_sha), graph_commit(main_sha)],
+            );
+        })
+        .unwrap();
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        wait_for_commit_history_to_settle(&panel, cx).await;
+
+        let history_shas = |panel: &GitPanel| {
+            panel
+                .commit_history_entries()
+                .iter()
+                .map(|entry| entry.sha)
+                .collect::<Vec<_>>()
+        };
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(history_shas(panel), vec![main_sha]);
+        });
+
+        let feature_branch = panel.read_with(cx, |panel, cx| {
+            panel
+                .active_repository
+                .as_ref()
+                .and_then(|repository| {
+                    repository
+                        .read(cx)
+                        .branch_list
+                        .iter()
+                        .find(|branch| branch.name() == "feature")
+                        .cloned()
+                })
+                .expect("feature branch should be listed")
+        });
+        panel.update(cx, |panel, cx| {
+            panel.set_history_branch(Some(feature_branch), cx);
+        });
+        cx.run_until_parked();
+        wait_for_commit_history_to_settle(&panel, cx).await;
+
+        panel.update(cx, |panel, cx| {
+            assert_eq!(history_shas(panel), vec![feature_sha, main_sha]);
+            assert!(panel.viewed_history_branch(cx).is_some());
+            assert!(panel.is_commit_in_current_branch(main_sha, cx));
+            assert!(!panel.is_commit_in_current_branch(feature_sha, cx));
+        });
+        let current_branch_name = fs
+            .with_git_state(dot_git, false, |state| state.current_branch_name.clone())
+            .unwrap();
+        assert_eq!(current_branch_name.as_deref(), Some("main"));
+
+        panel.update(cx, |panel, cx| {
+            panel.set_history_branch(None, cx);
+        });
+        cx.run_until_parked();
+        wait_for_commit_history_to_settle(&panel, cx).await;
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(history_shas(panel), vec![main_sha]);
         });
     }
 
