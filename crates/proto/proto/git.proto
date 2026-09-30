@@ -408,6 +408,47 @@ message StashPop {
   optional uint64 stash_index = 3;
 }
 
+message GitMerge {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string branch = 3;
+  uint64 askpass_id = 4;
+}
+
+enum GitMergeOutcome {
+  AlreadyUpToDate = 0;
+  FastForward = 1;
+  Merged = 2;
+  MergeConflicts = 3;
+}
+
+message GitMergeResponse {
+  GitMergeOutcome outcome = 1;
+}
+
+message GitCherryPick {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string commit = 3;
+  uint64 askpass_id = 4;
+}
+
+enum GitCherryPickOutcome {
+  Applied = 0;
+  AlreadyApplied = 1;
+  CherryPickConflicts = 2;
+}
+
+message GitCherryPickResponse {
+  GitCherryPickOutcome outcome = 1;
+}
+
+message GitAbortOperation {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  GitInProgressOperation operation = 3;
+}
+
 message StashApply {
   uint64 project_id = 1;
   uint64 repository_id = 2;

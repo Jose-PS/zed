@@ -524,7 +524,12 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+    GitMerge git_merge = 496;
+    GitMergeResponse git_merge_response = 497;
+    GitCherryPick git_cherry_pick = 498;
+    GitCherryPickResponse git_cherry_pick_response = 499;
+    GitAbortOperation git_abort_operation = 500; // current max
   }
 
   reserved 87 to 88;

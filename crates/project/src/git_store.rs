@@ -37,12 +37,12 @@ use git::{
     blame::Blame,
     parse_git_remote_url,
     repository::{
-        Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
-        CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InProgressOperation,
-        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
-        delete_branch_flag, is_binary_content,
+        Branch, BranchesScanResult, CherryPickOutcome, CommitData, CommitDetails, CommitFileStatus,
+        CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+        FileHistoryChangedFileSets, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+        InProgressOperation, InitialGraphCommitData, LogOrder, LogSource, MergeOutcome,
+        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -1053,6 +1053,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_unstage);
         client.add_entity_request_handler(Self::handle_stash);
         client.add_entity_request_handler(Self::handle_stash_pop);
+        client.add_entity_request_handler(Self::handle_git_merge);
+        client.add_entity_request_handler(Self::handle_git_cherry_pick);
+        client.add_entity_request_handler(Self::handle_git_abort_operation);
         client.add_entity_request_handler(Self::handle_stash_apply);
         client.add_entity_request_handler(Self::handle_stash_drop);
         client.add_entity_request_handler(Self::handle_commit);
@@ -3704,6 +3707,79 @@ impl GitStore {
                 repository_handle.stash_pop(stash_index, cx)
             })
             .await?;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_git_merge(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitMerge>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitMergeResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let askpass = make_remote_delegate(
+            this,
+            envelope.payload.project_id,
+            repository_id,
+            envelope.payload.askpass_id,
+            &mut cx,
+        );
+
+        let outcome = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.merge(envelope.payload.branch, askpass, cx)
+            })
+            .await??;
+
+        Ok(proto::GitMergeResponse {
+            outcome: merge_outcome_to_proto(outcome),
+        })
+    }
+
+    async fn handle_git_cherry_pick(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitCherryPick>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitCherryPickResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let askpass = make_remote_delegate(
+            this,
+            envelope.payload.project_id,
+            repository_id,
+            envelope.payload.askpass_id,
+            &mut cx,
+        );
+
+        let outcome = repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.cherry_pick(envelope.payload.commit, askpass, cx)
+            })
+            .await??;
+
+        Ok(proto::GitCherryPickResponse {
+            outcome: cherry_pick_outcome_to_proto(outcome),
+        })
+    }
+
+    async fn handle_git_abort_operation(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitAbortOperation>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let operation = in_progress_operation_from_proto(
+            proto::GitInProgressOperation::try_from(envelope.payload.operation)
+                .context("invalid in-progress git operation")?,
+        );
+
+        repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.abort_operation(operation)
+            })
+            .await??;
 
         Ok(proto::Ack {})
     }
@@ -8654,6 +8730,142 @@ impl Repository {
         )
     }
 
+    fn ensure_clean_for_operation(&self, operation: InProgressOperation) -> Result<()> {
+        if let Some(in_progress) = self.snapshot.merge.in_progress {
+            anyhow::bail!(
+                "A git {} is already in progress. Finish or abort it first.",
+                in_progress.subcommand()
+            );
+        }
+        let has_tracked_changes = self
+            .snapshot
+            .statuses_by_path
+            .iter()
+            .any(|entry| !entry.status.is_untracked() && !entry.status.is_ignored());
+        anyhow::ensure!(
+            !has_tracked_changes,
+            "Commit or stash your changes before running git {}.",
+            operation.subcommand()
+        );
+        Ok(())
+    }
+
+    pub fn merge(
+        &mut self,
+        branch: String,
+        askpass: AskPassDelegate,
+        _cx: &mut App,
+    ) -> oneshot::Receiver<Result<MergeOutcome>> {
+        if let Err(error) = self.ensure_clean_for_operation(InProgressOperation::Merge) {
+            let (sender, receiver) = oneshot::channel();
+            sender.send(Err(error)).ok();
+            return receiver;
+        }
+        let id = self.id;
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+
+        self.send_job(
+            "merge",
+            Some(format!("git merge {branch}").into()),
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.merge(branch, askpass, environment).await,
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let _askpass_operation =
+                            RemoteAskPassOperation::new(askpass_id, askpass, askpass_delegates);
+                        let response = client
+                            .request(proto::GitMerge {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                branch,
+                                askpass_id,
+                            })
+                            .await?;
+                        merge_outcome_from_proto(response.outcome)
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn cherry_pick(
+        &mut self,
+        commit: String,
+        askpass: AskPassDelegate,
+        _cx: &mut App,
+    ) -> oneshot::Receiver<Result<CherryPickOutcome>> {
+        if let Err(error) = self.ensure_clean_for_operation(InProgressOperation::CherryPick) {
+            let (sender, receiver) = oneshot::channel();
+            sender.send(Err(error)).ok();
+            return receiver;
+        }
+        let id = self.id;
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+
+        self.send_job(
+            "cherry_pick",
+            Some(format!("git cherry-pick {commit}").into()),
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.cherry_pick(commit, askpass, environment).await,
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let _askpass_operation =
+                            RemoteAskPassOperation::new(askpass_id, askpass, askpass_delegates);
+                        let response = client
+                            .request(proto::GitCherryPick {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                commit,
+                                askpass_id,
+                            })
+                            .await?;
+                        cherry_pick_outcome_from_proto(response.outcome)
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn abort_operation(
+        &mut self,
+        operation: InProgressOperation,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            "abort_operation",
+            Some(format!("git {} --abort", operation.subcommand()).into()),
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => backend.abort_operation(operation, environment).await,
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitAbortOperation {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                operation: in_progress_operation_to_proto(operation),
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        )
+    }
+
     async fn refresh_branch_list(
         this: &WeakEntity<Self>,
         backend: Arc<dyn GitRepository>,
@@ -11177,6 +11389,42 @@ fn in_progress_operation_to_proto(operation: InProgressOperation) -> i32 {
         InProgressOperation::CherryPick => proto::GitInProgressOperation::CherryPick as i32,
         InProgressOperation::Revert => proto::GitInProgressOperation::Revert as i32,
         InProgressOperation::Rebase => proto::GitInProgressOperation::Rebase as i32,
+    }
+}
+
+fn merge_outcome_to_proto(outcome: MergeOutcome) -> i32 {
+    match outcome {
+        MergeOutcome::AlreadyUpToDate => proto::GitMergeOutcome::AlreadyUpToDate as i32,
+        MergeOutcome::FastForward => proto::GitMergeOutcome::FastForward as i32,
+        MergeOutcome::Merged => proto::GitMergeOutcome::Merged as i32,
+        MergeOutcome::Conflicts => proto::GitMergeOutcome::MergeConflicts as i32,
+    }
+}
+
+fn merge_outcome_from_proto(outcome: i32) -> Result<MergeOutcome> {
+    match proto::GitMergeOutcome::try_from(outcome).context("invalid git merge outcome")? {
+        proto::GitMergeOutcome::AlreadyUpToDate => Ok(MergeOutcome::AlreadyUpToDate),
+        proto::GitMergeOutcome::FastForward => Ok(MergeOutcome::FastForward),
+        proto::GitMergeOutcome::Merged => Ok(MergeOutcome::Merged),
+        proto::GitMergeOutcome::MergeConflicts => Ok(MergeOutcome::Conflicts),
+    }
+}
+
+fn cherry_pick_outcome_to_proto(outcome: CherryPickOutcome) -> i32 {
+    match outcome {
+        CherryPickOutcome::Applied => proto::GitCherryPickOutcome::Applied as i32,
+        CherryPickOutcome::AlreadyApplied => proto::GitCherryPickOutcome::AlreadyApplied as i32,
+        CherryPickOutcome::Conflicts => proto::GitCherryPickOutcome::CherryPickConflicts as i32,
+    }
+}
+
+fn cherry_pick_outcome_from_proto(outcome: i32) -> Result<CherryPickOutcome> {
+    match proto::GitCherryPickOutcome::try_from(outcome)
+        .context("invalid git cherry-pick outcome")?
+    {
+        proto::GitCherryPickOutcome::Applied => Ok(CherryPickOutcome::Applied),
+        proto::GitCherryPickOutcome::AlreadyApplied => Ok(CherryPickOutcome::AlreadyApplied),
+        proto::GitCherryPickOutcome::CherryPickConflicts => Ok(CherryPickOutcome::Conflicts),
     }
 }
 
