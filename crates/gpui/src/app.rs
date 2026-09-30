@@ -1139,6 +1139,32 @@ impl App {
         self.platform.quit();
     }
 
+    /// Switches the platform between headless and windowed modes.
+    ///
+    /// Headless, windows opened afterwards lay out and handle input but draw nothing. Windowed,
+    /// the platform connects to the display server the environment names.
+    ///
+    /// The returned task resolves once the switch has been applied. It fails if the platform is
+    /// already in the requested mode (switching to another display server means going headless
+    /// first), if the platform doesn't allow the mode or can't switch at all, if any window is
+    /// open (a window belongs to the display server that opened it), or if the display server
+    /// can't be reached.
+    pub fn request_windowing(&self, request: crate::WindowingRequest) -> Task<anyhow::Result<()>> {
+        self.platform.request_windowing(request)
+    }
+
+    /// The environment of the display server the platform is connected to, or `None` while
+    /// headless. Its activation token is always unset, since the connection has used it.
+    ///
+    /// Programs an app launches inherit this process's environment, which may name another
+    /// graphical session, or none if the app started headless. Pass them this one with
+    /// [`GraphicalEnvironment::apply_to`](crate::GraphicalEnvironment::apply_to).
+    ///
+    /// Always `None` on platforms that can't switch windowing modes.
+    pub fn graphical_environment(&self) -> Option<crate::GraphicalEnvironment> {
+        self.platform.graphical_environment()
+    }
+
     /// Returns the current policy for hiding the cursor in response to
     /// keyboard input.
     pub fn cursor_hide_mode(&self) -> CursorHideMode {

@@ -24,6 +24,26 @@ pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
 
+/// Returns a Linux app that may switch among `allowed_modes`. It starts connected to the display
+/// server `graphical_environment` names, or headless when that's `None` or names none.
+///
+/// See [`gpui::App::request_windowing`].
+///
+/// # Panics
+///
+/// Panics if `allowed_modes` doesn't allow the starting mode, or if the display server can't be
+/// reached.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn linux(
+    allowed_modes: gpui::WindowingModes,
+    graphical_environment: Option<gpui::GraphicalEnvironment>,
+) -> gpui::Application {
+    gpui::Application::with_platform(gpui_linux::linux_platform(
+        allowed_modes,
+        graphical_environment,
+    ))
+}
+
 #[cfg(target_family = "wasm")]
 pub use gpui_web::WebBackendPreference;
 
