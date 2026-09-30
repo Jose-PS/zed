@@ -1038,10 +1038,11 @@
     "bindings": {
       "ctrl-1": "git_panel::ActivateChangesTab",
       "ctrl-2": "git_panel::ActivateHistoryTab",
+      "ctrl-3": "git_panel::ActivateBranchesTab",
     },
   },
   {
-    "context": "GitPanel && (ChangesList || HistoryList) && !GitBranchSelector && !GitRepositorySelector",
+    "context": "GitPanel && (ChangesList || HistoryList || BranchesList) && !GitBranchSelector && !GitRepositorySelector",
     "bindings": {
       "up": "menu::SelectPrevious",
       "down": "menu::SelectNext",

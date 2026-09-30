@@ -163,6 +163,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Branches tab.
+        ActivateBranchesTab,
     ]
 );
 
@@ -561,6 +563,43 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    Branches,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+enum BranchSection {
+    Local,
+    Remote,
+}
+
+impl BranchSection {
+    fn title(self) -> &'static str {
+        match self {
+            BranchSection::Local => "Local",
+            BranchSection::Remote => "Remote",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum BranchesListEntry {
+    Header(BranchSection),
+    Branch(Branch),
+}
+
+fn merge_entry_for_branch(
+    branch: &Branch,
+    current_branch: Option<&Branch>,
+    has_operation_in_progress: bool,
+) -> Option<(SharedString, bool)> {
+    let current_branch = current_branch?;
+    if current_branch.ref_name == branch.ref_name {
+        return None;
+    }
+    Some((
+        format!("Merge {} into {}", branch.name(), current_branch.name()).into(),
+        !has_operation_in_progress,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1169,6 +1208,10 @@ pub struct GitPanel {
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     history_branch: Option<Branch>,
+    branches_scroll_handle: UniformListScrollHandle,
+    focused_branch_entry: Option<usize>,
+    branches_keyboard_nav: bool,
+    collapsed_branch_sections: HashSet<BranchSection>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1422,6 +1465,13 @@ impl GitPanel {
                             })
                             .ok();
                     }
+                    GitStoreEvent::RepositoryUpdated(
+                        _,
+                        RepositoryEvent::BranchListChanged,
+                        true,
+                    ) => {
+                        cx.notify();
+                    }
                     GitStoreEvent::RepositoryUpdated(_, _, _) => {}
                     GitStoreEvent::JobsUpdated
                     | GitStoreEvent::ConflictsUpdated
@@ -1486,6 +1536,10 @@ impl GitPanel {
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 history_branch: None,
+                branches_scroll_handle: UniformListScrollHandle::new(),
+                focused_branch_entry: None,
+                branches_keyboard_nav: false,
+                collapsed_branch_sections: HashSet::from_iter([BranchSection::Remote]),
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -1998,6 +2052,7 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
+                GitPanelTab::Branches => dispatch_context.add("BranchesList"),
             }
         }
 
@@ -2014,6 +2069,10 @@ impl GitPanel {
         }
         if self.active_tab == GitPanelTab::History && self.focused_history_entry.is_some() {
             self.history_keyboard_nav = true;
+            cx.notify();
+        }
+        if self.active_tab == GitPanelTab::Branches && self.focused_branch_entry.is_some() {
+            self.branches_keyboard_nav = true;
             cx.notify();
         }
     }
@@ -2166,6 +2225,10 @@ impl GitPanel {
             self.select_previous_history_entry(cx);
             return;
         }
+        if self.active_tab == GitPanelTab::Branches {
+            self.select_previous_branch_entry(cx);
+            return;
+        }
 
         let item_count = self.entries.len();
         if item_count == 0 {
@@ -2243,6 +2306,10 @@ impl GitPanel {
     fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.select_next_history_entry(cx);
+            return;
+        }
+        if self.active_tab == GitPanelTab::Branches {
+            self.select_next_branch_entry(cx);
             return;
         }
 
@@ -2494,6 +2561,10 @@ impl GitPanel {
     fn open_diff(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == GitPanelTab::History {
             self.open_selected_history_commit(window, cx);
+            return;
+        }
+        if self.active_tab == GitPanelTab::Branches {
+            self.confirm_selected_branch_entry(window, cx);
             return;
         }
         if let Some(GitListEntry::Directory(dir_entry)) = self
@@ -7087,11 +7158,24 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(
+                Divider::vertical()
+                    .color(ui::DividerColor::BorderFaded)
+                    .h_full(),
+            )
+            .child(tab(
+                ElementId::Name("branches-tab".into()),
+                active_tab == GitPanelTab::Branches,
+                false,
+                "Branches".into(),
+                GitPanelTab::Branches,
+                ActivateBranchesTab.boxed_clone(),
             ))
     }
 
@@ -7387,6 +7471,452 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn activate_branches_tab(
+        &mut self,
+        _: &ActivateBranchesTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::Branches, window, cx);
+    }
+
+    fn branches_list_entries(&self, cx: &App) -> Vec<BranchesListEntry> {
+        let Some(active_repository) = self.active_repository.as_ref() else {
+            return Vec::new();
+        };
+        let (mut remote_branches, mut local_branches): (Vec<Branch>, Vec<Branch>) =
+            active_repository
+                .read(cx)
+                .branch_list
+                .iter()
+                .cloned()
+                .partition(Branch::is_remote);
+        let most_recent_first = |branch: &Branch| {
+            std::cmp::Reverse(
+                branch
+                    .most_recent_commit
+                    .as_ref()
+                    .map(|commit| commit.commit_timestamp),
+            )
+        };
+        local_branches.sort_by_key(most_recent_first);
+        remote_branches.sort_by_key(most_recent_first);
+
+        let mut entries = Vec::new();
+        for (section, branches) in [
+            (BranchSection::Local, local_branches),
+            (BranchSection::Remote, remote_branches),
+        ] {
+            if branches.is_empty() {
+                continue;
+            }
+            entries.push(BranchesListEntry::Header(section));
+            if !self.collapsed_branch_sections.contains(&section) {
+                entries.extend(branches.into_iter().map(BranchesListEntry::Branch));
+            }
+        }
+        entries
+    }
+
+    fn toggle_branch_section(&mut self, section: BranchSection, cx: &mut Context<Self>) {
+        if !self.collapsed_branch_sections.remove(&section) {
+            self.collapsed_branch_sections.insert(section);
+        }
+        cx.notify();
+    }
+
+    fn select_next_branch_entry(&mut self, cx: &mut Context<Self>) {
+        let count = self.branches_list_entries(cx).len();
+        if count == 0 {
+            return;
+        }
+        let new_index = match self.focused_branch_entry {
+            None => 0,
+            Some(index) => (index + 1).min(count - 1),
+        };
+        self.focused_branch_entry = Some(new_index);
+        self.branches_keyboard_nav = true;
+        self.branches_scroll_handle
+            .scroll_to_item(new_index, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn select_previous_branch_entry(&mut self, cx: &mut Context<Self>) {
+        let count = self.branches_list_entries(cx).len();
+        if count == 0 {
+            return;
+        }
+        let new_index = match self.focused_branch_entry {
+            None => 0,
+            Some(index) => index.saturating_sub(1).min(count - 1),
+        };
+        self.focused_branch_entry = Some(new_index);
+        self.branches_keyboard_nav = true;
+        self.branches_scroll_handle
+            .scroll_to_item(new_index, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn confirm_selected_branch_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.focused_branch_entry else {
+            return;
+        };
+        match self.branches_list_entries(cx).get(index).cloned() {
+            Some(BranchesListEntry::Header(section)) => self.toggle_branch_section(section, cx),
+            Some(BranchesListEntry::Branch(branch)) => self.show_branch_history(branch, window, cx),
+            None => {}
+        }
+    }
+
+    fn show_branch_history(&mut self, branch: Branch, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_history_branch(Some(branch), cx);
+        self.set_active_tab(GitPanelTab::History, window, cx);
+    }
+
+    fn merge_into_current_branch(
+        &mut self,
+        branch: Branch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        crate::merge_operations::merge_branch(
+            self.workspace.clone(),
+            active_repository,
+            branch.name().to_string(),
+            window,
+            cx,
+        );
+    }
+
+    fn deploy_branch_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(BranchesListEntry::Branch(branch)) =
+            self.branches_list_entries(cx).get(index).cloned()
+        else {
+            return;
+        };
+        let Some(active_repository) = self.active_repository.as_ref() else {
+            return;
+        };
+        let repository = active_repository.read(cx);
+        let merge_entry = merge_entry_for_branch(
+            &branch,
+            repository.branch.as_ref(),
+            repository.merge.in_progress.is_some(),
+        );
+        let git_panel = cx.weak_entity();
+        let focus_handle = self.focus_handle.clone();
+        let context_menu = ContextMenu::build(window, cx, move |context_menu, _, _| {
+            context_menu
+                .context(focus_handle)
+                .header(format!("Branch {}", branch.name()))
+                .entry("Show History", None, {
+                    let git_panel = git_panel.clone();
+                    let branch = branch.clone();
+                    move |window, cx| {
+                        git_panel
+                            .update(cx, |git_panel, cx| {
+                                git_panel.show_branch_history(branch.clone(), window, cx);
+                            })
+                            .ok();
+                    }
+                })
+                .when_some(merge_entry, |menu, (label, enabled)| {
+                    menu.separator()
+                        .item(ContextMenuEntry::new(label).disabled(!enabled).handler(
+                            move |window, cx| {
+                                git_panel
+                                    .update(cx, |git_panel, cx| {
+                                        git_panel.merge_into_current_branch(
+                                            branch.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .ok();
+                            },
+                        ))
+                })
+        });
+        self.focused_branch_entry = Some(index);
+        self.branches_keyboard_nav = false;
+        self.set_context_menu(context_menu, position, Some(index), window, cx);
+    }
+
+    fn render_branches_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self.branches_list_entries(cx);
+        let branch_list_error = self
+            .active_repository
+            .as_ref()
+            .is_some_and(|repository| repository.read(cx).branch_list_error.is_some());
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .map(|this| match self.active_repository {
+                None => this.child(Self::render_history_placeholder("No repository found")),
+                Some(_) if entries.is_empty() && branch_list_error => {
+                    this.child(Self::render_history_placeholder("Failed to load branches"))
+                }
+                Some(_) if entries.is_empty() => {
+                    this.child(Self::render_history_placeholder("No branches"))
+                }
+                Some(_) => this.child(self.render_branches_list(entries, window, cx)),
+            })
+    }
+
+    fn render_branches_list(
+        &self,
+        entries: Vec<BranchesListEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entries: Rc<[BranchesListEntry]> = entries.into();
+        let item_count = entries.len();
+        let branches_scroll_handle = self.branches_scroll_handle.clone();
+        let focused_branch_entry = self.focused_branch_entry;
+        let is_panel_focused = self.focus_handle.is_focused(window);
+        let show_focus_border = self.branches_keyboard_nav;
+        let has_context_menu = self.context_menu.is_some();
+        let context_menu_target_index = self
+            .context_menu
+            .as_ref()
+            .and_then(|context_menu| context_menu.target_entry_index);
+        let collapsed_branch_sections = self.collapsed_branch_sections.clone();
+        let row_height = rems(3.);
+        let git_panel = cx.weak_entity();
+
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(
+                uniform_list("branches_list", item_count, move |range, _window, cx| {
+                    let local_offset =
+                        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+                    let now = time::OffsetDateTime::now_utc();
+
+                    entries[range.clone()]
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, entry)| {
+                            let index = range.start + ix;
+                            let is_focused = focused_branch_entry == Some(index);
+                            let show_focus = is_focused && is_panel_focused && show_focus_border;
+                            match entry {
+                                BranchesListEntry::Header(section) => {
+                                    let section = *section;
+                                    let is_collapsed = collapsed_branch_sections.contains(&section);
+                                    let git_panel = git_panel.clone();
+                                    h_flex()
+                                        .id(("branches-header", index))
+                                        .h(row_height)
+                                        .w_full()
+                                        .pl_2p5()
+                                        .pr_1()
+                                        .pb_1()
+                                        .gap_1()
+                                        .items_end()
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(cx.theme().colors().ghost_element_hover)
+                                        })
+                                        .border_1()
+                                        .border_color(gpui::transparent_black())
+                                        .when(show_focus, |this| {
+                                            this.border_color(
+                                                cx.theme().colors().panel_focused_border,
+                                            )
+                                        })
+                                        .child(
+                                            Icon::new(if is_collapsed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(section.title())
+                                                .color(Color::Muted)
+                                                .size(LabelSize::Small),
+                                        )
+                                        .on_click(move |_, _, cx| {
+                                            git_panel
+                                                .update(cx, |git_panel, cx| {
+                                                    git_panel.focused_branch_entry = Some(index);
+                                                    git_panel.branches_keyboard_nav = false;
+                                                    git_panel.toggle_branch_section(section, cx);
+                                                })
+                                                .ok();
+                                        })
+                                        .into_any_element()
+                                }
+                                BranchesListEntry::Branch(branch) => {
+                                    let is_context_menu_target =
+                                        context_menu_target_index == Some(index);
+                                    let last_commit =
+                                        branch.most_recent_commit.as_ref().map(|commit| {
+                                            let relative_time: SharedString =
+                                                time::OffsetDateTime::from_unix_timestamp(
+                                                    commit.commit_timestamp,
+                                                )
+                                                .map(|date_time| {
+                                                    time_format::format_localized_timestamp(
+                                                        date_time,
+                                                        now,
+                                                        local_offset,
+                                                        time_format::TimestampFormat::Relative,
+                                                    )
+                                                    .into()
+                                                })
+                                                .unwrap_or_default();
+                                            (commit.subject.clone(), relative_time)
+                                        });
+
+                                    v_flex()
+                                        .id(("branch-item", index))
+                                        .cursor_pointer()
+                                        .h(row_height)
+                                        .w_full()
+                                        .justify_center()
+                                        .overflow_hidden()
+                                        .py_1()
+                                        .px_2()
+                                        .gap_0p5()
+                                        .border_1()
+                                        .border_color(gpui::transparent_black())
+                                        .when(show_focus, |this| {
+                                            this.border_color(
+                                                cx.theme().colors().panel_focused_border,
+                                            )
+                                        })
+                                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                        .when(is_context_menu_target, |this| {
+                                            this.bg(cx.theme().colors().element_hover)
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .w_full()
+                                                .min_w_0()
+                                                .child(
+                                                    Icon::new(if branch.is_head {
+                                                        IconName::Check
+                                                    } else {
+                                                        IconName::GitBranch
+                                                    })
+                                                    .size(IconSize::XSmall)
+                                                    .color(if branch.is_head {
+                                                        Color::Accent
+                                                    } else {
+                                                        Color::Muted
+                                                    }),
+                                                )
+                                                .child(
+                                                    Label::new(SharedString::from(
+                                                        branch.name().to_string(),
+                                                    ))
+                                                    .truncate(),
+                                                ),
+                                        )
+                                        .when_some(last_commit, |this, (subject, relative_time)| {
+                                            this.child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .gap_1p5()
+                                                    .when(!relative_time.is_empty(), |this| {
+                                                        this.child(
+                                                            Label::new(relative_time)
+                                                                .size(LabelSize::Small)
+                                                                .color(Color::Muted)
+                                                                .flex_none(),
+                                                        )
+                                                        .child(
+                                                            Label::new("•")
+                                                                .size(LabelSize::Small)
+                                                                .color(Color::Muted)
+                                                                .alpha(0.5)
+                                                                .flex_none(),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        Label::new(subject)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted)
+                                                            .truncate(),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!has_context_menu, |this| {
+                                            this.tooltip(Tooltip::text("Show Branch History"))
+                                        })
+                                        .on_mouse_down(MouseButton::Left, {
+                                            let git_panel = git_panel.clone();
+                                            move |_, _, cx| {
+                                                git_panel
+                                                    .update(cx, |git_panel, cx| {
+                                                        git_panel.focused_branch_entry =
+                                                            Some(index);
+                                                        git_panel.branches_keyboard_nav = false;
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                            }
+                                        })
+                                        .on_mouse_down(MouseButton::Right, {
+                                            let git_panel = git_panel.clone();
+                                            move |event, window, cx| {
+                                                git_panel
+                                                    .update(cx, |git_panel, cx| {
+                                                        git_panel.deploy_branch_context_menu(
+                                                            event.position,
+                                                            index,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                                cx.stop_propagation();
+                                            }
+                                        })
+                                        .on_click({
+                                            let git_panel = git_panel.clone();
+                                            let branch = branch.clone();
+                                            move |_, window, cx| {
+                                                git_panel
+                                                    .update(cx, |git_panel, cx| {
+                                                        git_panel.show_branch_history(
+                                                            branch.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                            }
+                                        })
+                                        .into_any_element()
+                                }
+                            }
+                        })
+                        .collect()
+                })
+                .size_full()
+                .track_scroll(&branches_scroll_handle),
+            )
+            .vertical_scrollbar_for(&branches_scroll_handle, window, cx)
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -7397,7 +7927,7 @@ impl GitPanel {
             GitPanelTab::History => {
                 self.load_commit_history(cx);
             }
-            GitPanelTab::Changes => {
+            GitPanelTab::Changes | GitPanelTab::Branches => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
@@ -9359,6 +9889,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_branches_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9395,6 +9926,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::Branches => this.child(self.render_branches_tab(window, cx)),
                     })
                     .into_any_element(),
             )
@@ -10774,6 +11306,124 @@ mod tests {
         panel.read_with(cx, |panel, _| {
             assert_eq!(history_shas(panel), vec![main_sha]);
         });
+    }
+
+    #[test]
+    fn test_merge_entry_for_branch() {
+        let branch = |ref_name: &str| Branch {
+            is_head: false,
+            ref_name: ref_name.to_string().into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+        let main = branch("refs/heads/main");
+        let feature = branch("refs/heads/feature");
+        let remote_feature = branch("refs/remotes/origin/feature");
+
+        assert_eq!(
+            merge_entry_for_branch(&feature, Some(&main), false),
+            Some(("Merge feature into main".into(), true))
+        );
+        assert_eq!(
+            merge_entry_for_branch(&remote_feature, Some(&main), false),
+            Some(("Merge origin/feature into main".into(), true))
+        );
+        assert_eq!(
+            merge_entry_for_branch(&feature, Some(&main), true),
+            Some(("Merge feature into main".into(), false))
+        );
+        assert_eq!(merge_entry_for_branch(&main, Some(&main), false), None);
+        assert_eq!(merge_entry_for_branch(&feature, None, false), None);
+    }
+
+    #[gpui::test]
+    async fn test_branches_tab_lists_branches_shows_history_and_merges(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+        let dot_git = Path::new(path!("/root/project/.git"));
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.insert_branches(dot_git, &["main", "feature", "origin/feature"]);
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/root/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        cx.executor().run_until_parked();
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.activate_branches_tab(&ActivateBranchesTab, window, cx);
+        });
+        cx.run_until_parked();
+
+        let entry_names = |panel: &GitPanel, cx: &App| {
+            panel
+                .branches_list_entries(cx)
+                .into_iter()
+                .map(|entry| match entry {
+                    BranchesListEntry::Header(section) => section.title().to_string(),
+                    BranchesListEntry::Branch(branch) => branch.name().to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab, GitPanelTab::Branches);
+            let names = entry_names(panel, cx);
+            assert_eq!(names.first().map(String::as_str), Some("Local"));
+            assert!(names.contains(&"main".to_string()));
+            assert!(names.contains(&"feature".to_string()));
+            assert_eq!(names.last().map(String::as_str), Some("Remote"));
+        });
+
+        panel.update(cx, |panel, cx| {
+            panel.toggle_branch_section(BranchSection::Remote, cx);
+        });
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                entry_names(panel, cx).last().map(String::as_str),
+                Some("origin/feature")
+            );
+        });
+
+        let feature_branch = panel.read_with(cx, |panel, cx| {
+            panel
+                .branches_list_entries(cx)
+                .into_iter()
+                .find_map(|entry| match entry {
+                    BranchesListEntry::Branch(branch) if branch.name() == "feature" => Some(branch),
+                    _ => None,
+                })
+                .expect("feature branch should be listed")
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.show_branch_history(feature_branch.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab, GitPanelTab::History);
+            assert_eq!(
+                panel
+                    .viewed_history_branch(cx)
+                    .map(|branch| branch.ref_name.clone()),
+                Some(feature_branch.ref_name.clone())
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.merge_into_current_branch(feature_branch.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let merged_branches = fs
+            .with_git_state(dot_git, false, |state| state.merged_branches.clone())
+            .unwrap();
+        assert_eq!(merged_branches, vec!["feature".to_string()]);
     }
 
     #[gpui::test]

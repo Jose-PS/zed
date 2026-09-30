@@ -1,5 +1,5 @@
 use askpass::AskPassDelegate;
-use git::repository::{CherryPickOutcome, InProgressOperation};
+use git::repository::{CherryPickOutcome, InProgressOperation, MergeOutcome};
 use git_ui_core::{askpass_modal::AskPassModal, notifications::show_error_toast};
 use gpui::{App, Entity, PromptLevel, SharedString, WeakEntity, Window};
 use notifications::status_toast::StatusToast;
@@ -69,6 +69,19 @@ fn current_branch_name(repository: &Entity<Repository>, cx: &App) -> String {
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
+pub(crate) fn merge_message(outcome: MergeOutcome, branch: &str, current_branch: &str) -> String {
+    match outcome {
+        MergeOutcome::AlreadyUpToDate => {
+            format!("{current_branch} is already up to date with {branch}")
+        }
+        MergeOutcome::FastForward => format!("Fast-forwarded {current_branch} to {branch}"),
+        MergeOutcome::Merged => format!("Merged {branch} into {current_branch}"),
+        MergeOutcome::Conflicts => {
+            format!("Merging {branch} has conflicts. Resolve them and commit to finish")
+        }
+    }
+}
+
 pub(crate) fn cherry_pick_message(
     outcome: CherryPickOutcome,
     short_sha: &str,
@@ -83,6 +96,40 @@ pub(crate) fn cherry_pick_message(
             format!("Cherry-picking {short_sha} has conflicts. Resolve them and commit to finish")
         }
     }
+}
+
+pub(crate) fn merge_branch(
+    workspace: WeakEntity<Workspace>,
+    repository: Entity<Repository>,
+    branch: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let askpass = operation_askpass_delegate(workspace.clone(), "git merge", window, cx);
+    let current_branch = current_branch_name(&repository, cx);
+    let receiver = repository.update(cx, |repository, cx| {
+        repository.merge(branch.clone(), askpass, cx)
+    });
+    cx.spawn(async move |cx| {
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(canceled) => Err(canceled.into()),
+        };
+        cx.update(|cx| match result {
+            Ok(outcome) => show_operation_toast(
+                &workspace,
+                merge_message(outcome, &branch, &current_branch),
+                outcome == MergeOutcome::Conflicts,
+                cx,
+            ),
+            Err(error) => {
+                if let Some(workspace) = workspace.upgrade() {
+                    show_error_toast(workspace, "merge", error, cx);
+                }
+            }
+        });
+    })
+    .detach();
 }
 
 pub(crate) fn cherry_pick_commit(
@@ -171,6 +218,26 @@ pub(crate) fn in_progress_operation_label(operation: InProgressOperation) -> &'s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_merge_message() {
+        assert_eq!(
+            merge_message(MergeOutcome::Merged, "dev", "main"),
+            "Merged dev into main"
+        );
+        assert_eq!(
+            merge_message(MergeOutcome::FastForward, "dev", "main"),
+            "Fast-forwarded main to dev"
+        );
+        assert_eq!(
+            merge_message(MergeOutcome::AlreadyUpToDate, "dev", "main"),
+            "main is already up to date with dev"
+        );
+        assert_eq!(
+            merge_message(MergeOutcome::Conflicts, "dev", "main"),
+            "Merging dev has conflicts. Resolve them and commit to finish"
+        );
+    }
 
     #[test]
     fn test_cherry_pick_message() {
