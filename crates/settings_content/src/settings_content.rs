@@ -274,6 +274,8 @@ pub struct SettingsContent {
 
     pub project_panel: Option<ProjectPanelSettingsContent>,
 
+    pub sail_manager: Option<SailManagerSettingsContent>,
+
     /// Configuration for Node-related features
     pub node: Option<NodeBinarySettings>,
 
@@ -407,7 +409,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
-        node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
+        sail_manager, node, proxy, reduce_motion, server_url, credentials_url, session, telemetry,
+        terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
         instrumentation,
     },
@@ -1229,6 +1232,132 @@ pub struct OutlinePanelSettingsContent {
     ///
     /// Default: false
     pub multi_buffer_hide_symbols: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct SailManagerSettingsContent {
+    #[serde(flatten)]
+    pub project: ProjectSailManagerSettingsContent,
+    pub button: Option<bool>,
+    pub dock: Option<DockSide>,
+    pub default_width: Option<PixelSetting>,
+}
+
+fallible_options::flattened_deserialize!(SailManagerSettingsContent {
+    sections: { project },
+    options: { button, dock, default_width },
+    defaults: {},
+});
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct ProjectSailManagerSettingsContent {
+    pub app_service: Option<String>,
+    pub url_host: Option<String>,
+    pub compose_files: Option<Vec<String>>,
+    pub shell: Option<ShellPreferenceContent>,
+    pub manual_urls: Option<HashMap<String, String>>,
+    pub node_package_manager: Option<NodePackageManagerContent>,
+    pub actions: Option<Vec<CustomActionContent>>,
+    pub refresh_mode: Option<RefreshModeContent>,
+    pub auto_assign_ports: Option<bool>,
+    pub port_pins: Option<HashMap<String, u16>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct CustomActionContent {
+    #[serde(default)]
+    pub name: String,
+    pub service: Option<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub working_directory: Option<String>,
+    pub mode: Option<CustomActionModeContent>,
+    pub confirm: Option<bool>,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomActionModeContent {
+    Terminal,
+    Background,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePackageManagerContent {
+    Auto,
+    Npm,
+    Pnpm,
+    Yarn,
+    Bun,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshModeContent {
+    EventsAndPoll,
+    Events,
+    Manual,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPreferenceContent {
+    Auto,
+    Zsh,
+    Bash,
+    Sh,
 }
 
 #[derive(

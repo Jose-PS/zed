@@ -1061,6 +1061,21 @@
     // Does not affect single-file views.
     "multi_buffer_hide_symbols": false,
   },
+  "sail_manager": {
+    "button": true,
+    "dock": "right",
+    "default_width": 320,
+    "app_service": "laravel.test",
+    "url_host": "localhost",
+    "compose_files": [],
+    "shell": "auto",
+    "manual_urls": {},
+    "node_package_manager": "auto",
+    "actions": [],
+    "refresh_mode": "events_and_poll",
+    "auto_assign_ports": true,
+    "port_pins": {},
+  },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
     "button": true,

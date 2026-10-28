@@ -132,6 +132,7 @@ hang_telemetry.workspace = true
 image = { workspace = true, optional = true }
 itertools.workspace = true
 rayon.workspace = true
+sail_manager.workspace = true
 semver.workspace = true
 system_specs.workspace = true
 tabular_data_preview.workspace = true
