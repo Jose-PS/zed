@@ -85,12 +85,15 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    pub sail_manager: Option<crate::ProjectSailManagerSettingsContent>,
 }
 
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        sail_manager,
     },
     defaults: { lsp, dap, context_servers },
 });

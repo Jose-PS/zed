@@ -27,6 +27,7 @@
   - [Debugger](./debugger.md)
   - [REPL](./repl.md)
 - [Git](./git.md)
+- [Sail Manager](./sail-manager.md)
 - [Modelines](./modelines.md)
 
 # Collaboration

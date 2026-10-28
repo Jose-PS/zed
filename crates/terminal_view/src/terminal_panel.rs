@@ -20,7 +20,7 @@ use project::{Fs, Project};
 
 use settings::{Settings, TerminalDockPosition};
 use task::{RevealStrategy, RevealTarget, Shell, ShellBuilder, SpawnInTerminal, TaskId};
-use terminal::{Terminal, terminal_settings::TerminalSettings};
+use terminal::{TaskStatus, Terminal, terminal_settings::TerminalSettings};
 use ui::{
     ButtonLike, Clickable, CommonAnimationExt, ContextMenu, FluentBuilder, PopoverMenu,
     SplitButton, Toggleable, Tooltip, prelude::*,
@@ -817,6 +817,54 @@ impl TerminalPanel {
             )
             .sorted_by_key(|(_, _, terminal_view)| terminal_view.entity_id())
             .collect()
+    }
+
+    pub fn focus_running_task_terminal(
+        &mut self,
+        full_label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((item_index, task_pane, terminal_view)) = self
+            .terminals_for_task(full_label, cx)
+            .into_iter()
+            .rev()
+            .find(|(_, _, terminal_view)| {
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .task()
+                    .is_some_and(|task_state| task_state.status == TaskStatus::Running)
+            })
+        else {
+            return false;
+        };
+
+        let is_dock_pane = self
+            .center
+            .panes()
+            .iter()
+            .any(|dock_pane| **dock_pane == task_pane);
+        if is_dock_pane {
+            self.activate_terminal_view(&task_pane, item_index, true, window, cx);
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |_, cx| {
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.focus_panel::<Self>(window, cx)
+                    })
+                    .ok();
+            })
+            .detach();
+        } else {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.activate_item(&terminal_view, true, true, window, cx)
+                })
+                .ok();
+        }
+        true
     }
 
     fn activate_terminal_view(
@@ -2761,6 +2809,64 @@ mod tests {
                 "with no modal open, a new task terminal should take focus"
             );
         });
+    }
+
+    #[cfg(not(windows))]
+    #[gpui::test]
+    async fn test_focus_running_task_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let long_task = SpawnInTerminal {
+            full_label: "long task".to_owned(),
+            command: Some("sleep".to_owned()),
+            args: vec!["30".to_owned()],
+            ..SpawnInTerminal::default()
+        };
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_task(long_task, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("Failed to spawn the long task terminal");
+        terminal_panel
+            .update_in(cx, |terminal_panel, window, cx| {
+                terminal_panel.add_terminal_task(echo_task(), RevealStrategy::Always, window, cx)
+            })
+            .await
+            .expect("Failed to spawn the echo task terminal");
+        cx.run_until_parked();
+
+        let long_task_view = terminal_panel.update(cx, |terminal_panel, cx| {
+            terminal_panel
+                .terminals_for_task("long task", cx)
+                .pop()
+                .map(|(_, _, terminal_view)| terminal_view)
+                .expect("the long task terminal should exist")
+        });
+
+        let focused = terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            terminal_panel.focus_running_task_terminal("long task", window, cx)
+        });
+        cx.run_until_parked();
+        assert!(focused);
+        terminal_panel.update_in(cx, |terminal_panel, _, cx| {
+            let active = terminal_panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.downcast::<TerminalView>())
+                .expect("a terminal should be active");
+            assert_eq!(active.entity_id(), long_task_view.entity_id());
+        });
+
+        let missing = terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+            terminal_panel.focus_running_task_terminal("other task", window, cx)
+        });
+        assert!(!missing);
     }
 
     #[gpui::test]

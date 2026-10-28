@@ -16033,6 +16033,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0ba8adb63e0deebd0744d8fc5bea394c08029159deaf680513fec1a3949144"
 
 [[package]]
+name = "sail_manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "menu",
+ "paths",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "task",
+ "terminal_view",
+ "theme",
+ "theme_settings",
+ "ui",
+ "ui_input",
+ "util",
+ "which",
+ "workspace",
+ "worktree",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22912,6 +22942,7 @@ dependencies = [
  "repl",
  "reqwest_client",
  "rope",
+ "sail_manager",
  "sandbox",
  "search",
  "semver",

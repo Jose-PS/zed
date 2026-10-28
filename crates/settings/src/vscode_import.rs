@@ -220,6 +220,7 @@ impl VsCodeSettings {
             preview_tabs: self.preview_tabs_settings_content(),
             project: self.project_settings_content(),
             project_panel: self.project_panel_settings_content(),
+            sail_manager: None,
             proxy: self.read_string("http.proxy"),
             reduce_motion: self.read_enum("workbench.reduceMotion", |s| match s {
                 "on" => Some(ReduceMotionMode::On),
@@ -546,6 +547,7 @@ impl VsCodeSettings {
             load_direnv: None,
             git_hosting_providers: None,
             disable_ai: None,
+            sail_manager: None,
         }
     }
 
