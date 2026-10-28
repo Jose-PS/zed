@@ -25,12 +25,47 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 pub(crate) struct CommitContextMenuData {
     pub(crate) sha: Oid,
     pub(crate) tag_names: Vec<SharedString>,
+    pub(crate) is_merge_commit: bool,
+    pub(crate) is_in_current_branch: bool,
+}
+
+struct CurrentRepositoryState {
+    branch_name: Option<SharedString>,
+    head_sha: Option<SharedString>,
+    has_operation_in_progress: bool,
+}
+
+fn cherry_pick_entry_enabled(
+    source: CommitContextMenuSource,
+    ref_name: Option<&SharedString>,
+    commit: &CommitContextMenuData,
+    state: &CurrentRepositoryState,
+) -> Option<(SharedString, bool)> {
+    let offers_cherry_pick = match source {
+        CommitContextMenuSource::GitGraph => ref_name.is_none(),
+        CommitContextMenuSource::GitPanel {
+            viewing_other_branch,
+        } => viewing_other_branch,
+    };
+    if !offers_cherry_pick {
+        return None;
+    }
+    let current_branch = state.branch_name.clone()?;
+    let is_head = state
+        .head_sha
+        .as_ref()
+        .is_some_and(|head_sha| head_sha.as_ref() == commit.sha.to_string());
+    let enabled = !commit.is_merge_commit
+        && !commit.is_in_current_branch
+        && !is_head
+        && !state.has_operation_in_progress;
+    Some((current_branch, enabled))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitContextMenuSource {
     GitGraph,
-    GitPanel,
+    GitPanel { viewing_other_branch: bool },
 }
 
 pub(crate) fn commit_context_menu(
@@ -54,6 +89,26 @@ pub(crate) fn commit_context_menu(
         Some(ref_name) => format!("Ref {ref_name}"),
         None => format!("Commit {sha_short}"),
     };
+    let repository_state = repository
+        .as_ref()
+        .and_then(|repository| repository.upgrade())
+        .map(|repository| {
+            let repository = repository.read(cx);
+            CurrentRepositoryState {
+                branch_name: repository
+                    .branch
+                    .as_ref()
+                    .map(|branch| SharedString::from(branch.name().to_string())),
+                head_sha: repository
+                    .head_commit
+                    .as_ref()
+                    .map(|head_commit| head_commit.sha.clone()),
+                has_operation_in_progress: repository.merge.in_progress.is_some(),
+            }
+        });
+    let cherry_pick_entry = repository_state
+        .as_ref()
+        .and_then(|state| cherry_pick_entry_enabled(source, ref_name.as_ref(), &commit, state));
 
     ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
@@ -129,15 +184,42 @@ pub(crate) fn commit_context_menu(
                     }
                 })
             })
-            .when(source == CommitContextMenuSource::GitPanel, |menu| {
-                menu.entry("Show in Git Graph", None, move |window, cx| {
-                    window.dispatch_action(
-                        Box::new(crate::git_graph::OpenAtCommit {
-                            sha: sha.to_string(),
+            .when(
+                matches!(source, CommitContextMenuSource::GitPanel { .. }),
+                |menu| {
+                    menu.entry("Show in Git Graph", None, move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(crate::git_graph::OpenAtCommit {
+                                sha: sha.to_string(),
+                            }),
+                            cx,
+                        );
+                    })
+                },
+            )
+            .when(cherry_pick_entry.is_some(), |menu| menu.separator())
+            .when_some(cherry_pick_entry, |menu, (current_branch, enabled)| {
+                let repository = repository.clone();
+                let workspace = workspace.clone();
+                let sha_short = sha_short.clone();
+                menu.item(
+                    ContextMenuEntry::new(format!("Cherry-pick into {current_branch}"))
+                        .disabled(!enabled)
+                        .handler(move |window, cx| {
+                            let Some(repository) = repository.as_ref().and_then(|r| r.upgrade())
+                            else {
+                                return;
+                            };
+                            crate::merge_operations::cherry_pick_commit(
+                                workspace.clone(),
+                                repository,
+                                sha.to_string(),
+                                sha_short.clone(),
+                                window,
+                                cx,
+                            );
                         }),
-                        cx,
-                    );
-                })
+                )
             })
             .map(|mut menu| {
                 menu = menu.separator().header("Custom Commands");
@@ -240,4 +322,126 @@ fn git_context_menu_tasks(
     task_inventory
         .read(cx)
         .resolve_global_tasks_with_tag(GIT_COMMAND_TASK_TAG, &task_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repository_state(
+        branch_name: Option<&str>,
+        head_sha: Option<&str>,
+    ) -> CurrentRepositoryState {
+        CurrentRepositoryState {
+            branch_name: branch_name.map(|name| SharedString::from(name.to_string())),
+            head_sha: head_sha.map(|sha| SharedString::from(sha.to_string())),
+            has_operation_in_progress: false,
+        }
+    }
+
+    fn commit_data(sha: Oid, is_merge_commit: bool) -> CommitContextMenuData {
+        CommitContextMenuData {
+            sha,
+            tag_names: Vec::new(),
+            is_merge_commit,
+            is_in_current_branch: false,
+        }
+    }
+
+    #[test]
+    fn test_cherry_pick_entry_state() {
+        let head_sha = Oid::from_bytes(&[1; 20]).unwrap();
+        let other_sha = Oid::from_bytes(&[2; 20]).unwrap();
+        let head_sha_string = head_sha.to_string();
+        let state = repository_state(Some("main"), Some(&head_sha_string));
+        let main = SharedString::from("main");
+
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitGraph,
+                None,
+                &commit_data(other_sha, false),
+                &state
+            ),
+            Some((main.clone(), true))
+        );
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitGraph,
+                None,
+                &commit_data(other_sha, true),
+                &state
+            ),
+            Some((main.clone(), false))
+        );
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitGraph,
+                None,
+                &commit_data(head_sha, false),
+                &state
+            ),
+            Some((main.clone(), false))
+        );
+
+        let busy_state = CurrentRepositoryState {
+            has_operation_in_progress: true,
+            ..repository_state(Some("main"), Some(&head_sha_string))
+        };
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitGraph,
+                None,
+                &commit_data(other_sha, false),
+                &busy_state
+            ),
+            Some((main.clone(), false))
+        );
+
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitPanel {
+                    viewing_other_branch: false
+                },
+                None,
+                &commit_data(other_sha, false),
+                &state
+            ),
+            None
+        );
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitPanel {
+                    viewing_other_branch: true
+                },
+                None,
+                &commit_data(other_sha, false),
+                &state
+            ),
+            Some((main.clone(), true))
+        );
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitPanel {
+                    viewing_other_branch: true
+                },
+                None,
+                &CommitContextMenuData {
+                    is_in_current_branch: true,
+                    ..commit_data(other_sha, false)
+                },
+                &state
+            ),
+            Some((main, false))
+        );
+        assert_eq!(
+            cherry_pick_entry_enabled(
+                CommitContextMenuSource::GitGraph,
+                Some(&SharedString::from("dev")),
+                &commit_data(other_sha, false),
+                &state
+            ),
+            None
+        );
+    }
 }

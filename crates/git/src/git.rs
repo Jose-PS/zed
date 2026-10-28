@@ -91,6 +91,8 @@ actions!(
         StashPop,
         /// Apply the most recent stash.
         StashApply,
+        /// Aborts the merge or cherry-pick in progress.
+        AbortOperation,
         /// Restores all tracked files to their last committed state.
         RestoreTrackedFiles,
         /// Moves all untracked files to trash.

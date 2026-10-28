@@ -464,6 +464,40 @@ pub struct CommitOptions {
     pub no_verify: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MergeOutcome {
+    AlreadyUpToDate,
+    FastForward,
+    Merged,
+    Conflicts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CherryPickOutcome {
+    Applied,
+    AlreadyApplied,
+    Conflicts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InProgressOperation {
+    Merge,
+    CherryPick,
+    Revert,
+    Rebase,
+}
+
+impl InProgressOperation {
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            InProgressOperation::Merge => "merge",
+            InProgressOperation::CherryPick => "cherry-pick",
+            InProgressOperation::Revert => "revert",
+            InProgressOperation::Rebase => "rebase",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum UpstreamTracking {
     /// Remote ref not present in local repository.
@@ -976,6 +1010,26 @@ pub trait GitRepository: Send + Sync {
         name_and_email: Option<(SharedString, SharedString)>,
         options: CommitOptions,
         askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn merge(
+        &self,
+        branch: String,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<MergeOutcome>>;
+
+    fn cherry_pick(
+        &self,
+        commit: String,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<CherryPickOutcome>>;
+
+    fn abort_operation(
+        &self,
+        operation: InProgressOperation,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
@@ -2794,6 +2848,112 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn merge(
+        &self,
+        branch: String,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<MergeOutcome>> {
+        let git = self.git_binary_in_worktree();
+        let executor = self.executor.clone();
+        async move {
+            let git = git?;
+            anyhow::ensure!(!branch.starts_with('-'), "Invalid branch name: {branch}");
+            let head_before = git.run(&["rev-parse", "HEAD"]).await?;
+
+            let mut command = git.build_command(&["merge", "--no-edit"]);
+            command
+                .envs(env.iter())
+                .arg(&branch)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            if let Err(error) = run_git_command(env, ask_pass, command, executor).await {
+                if ref_exists(&git, "MERGE_HEAD").await {
+                    return Ok(MergeOutcome::Conflicts);
+                }
+                return Err(error);
+            }
+
+            let head_after = git.run(&["rev-parse", "HEAD"]).await?;
+            if head_after == head_before {
+                Ok(MergeOutcome::AlreadyUpToDate)
+            } else if ref_exists(&git, "HEAD^2").await
+                && git.run(&["rev-parse", "HEAD^1"]).await? == head_before
+            {
+                Ok(MergeOutcome::Merged)
+            } else {
+                Ok(MergeOutcome::FastForward)
+            }
+        }
+        .boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        commit: String,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<CherryPickOutcome>> {
+        let git = self.git_binary_in_worktree();
+        let executor = self.executor.clone();
+        async move {
+            let git = git?;
+            anyhow::ensure!(!commit.starts_with('-'), "Invalid commit: {commit}");
+
+            let ancestor_check = git
+                .build_command(&["merge-base", "--is-ancestor", commit.as_str(), "HEAD"])
+                .output()
+                .await?;
+            match ancestor_check.status.code() {
+                Some(0) => return Ok(CherryPickOutcome::AlreadyApplied),
+                Some(1) => {}
+                _ => anyhow::bail!(
+                    "Failed to cherry-pick {commit}:\n{}",
+                    String::from_utf8_lossy(&ancestor_check.stderr)
+                ),
+            }
+
+            let mut command = git.build_command(&["cherry-pick"]);
+            command
+                .envs(env.iter())
+                .arg(&commit)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let Err(error) = run_git_command(env.clone(), ask_pass, command, executor).await else {
+                return Ok(CherryPickOutcome::Applied);
+            };
+
+            if !ref_exists(&git, "CHERRY_PICK_HEAD").await {
+                return Err(error);
+            }
+
+            let conflicted_paths = git.run(&["diff", "--name-only", "--diff-filter=U"]).await?;
+            if conflicted_paths.is_empty() {
+                abort_in_progress_operation(&git, InProgressOperation::CherryPick, &env).await?;
+                Ok(CherryPickOutcome::AlreadyApplied)
+            } else {
+                Ok(CherryPickOutcome::Conflicts)
+            }
+        }
+        .boxed()
+    }
+
+    fn abort_operation(
+        &self,
+        operation: InProgressOperation,
+        env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                abort_in_progress_operation(&git, operation, &env).await
+            })
+            .boxed()
+    }
+
     fn update_ref(&self, ref_name: String, commit: String) -> BoxFuture<'_, Result<()>> {
         self.edit_ref(RefEdit::Update { ref_name, commit })
     }
@@ -4028,6 +4188,31 @@ struct GitBinaryCommandError {
     stdout: String,
     stderr: String,
     status: ExitStatus,
+}
+
+async fn ref_exists(git: &GitBinary, reference: &str) -> bool {
+    git.run(&["rev-parse", "--verify", "--quiet", reference])
+        .await
+        .is_ok()
+}
+
+async fn abort_in_progress_operation(
+    git: &GitBinary,
+    operation: InProgressOperation,
+    env: &HashMap<String, String>,
+) -> Result<()> {
+    let subcommand = operation.subcommand();
+    let output = git
+        .build_command(&[subcommand, "--abort"])
+        .envs(env.iter())
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Failed to abort {subcommand}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 async fn run_git_command(
@@ -7009,6 +7194,333 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+
+    fn open_real_repository(path: &Path, cx: &TestAppContext) -> RealGitRepository {
+        RealGitRepository::new(&path.join(".git"), None, Some("git".into()), cx.executor()).unwrap()
+    }
+
+    fn commit_file(repository_path: &Path, file_name: &str, contents: &str, message: &str) {
+        fs::write(repository_path.join(file_name), contents).unwrap();
+        git_command(repository_path, ["add", file_name]);
+        git_command(repository_path, ["commit", "-m", message]);
+    }
+
+    fn operation_envs() -> Arc<HashMap<String, String>> {
+        let mut env = test_commit_envs();
+        env.insert("GIT_EDITOR".to_string(), "false".to_string());
+        Arc::new(env)
+    }
+
+    fn init_repository_with_main_commit(repository_path: &Path) {
+        git_init_repo(repository_path);
+        commit_file(repository_path, "file.txt", "base\n", "initial");
+    }
+
+    #[gpui::test]
+    async fn test_merge_fast_forward(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        commit_file(&repository_path, "feature.txt", "feature\n", "feature");
+        git_command(&repository_path, ["switch", "main"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .merge(
+                "feature".to_string(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD"]),
+            git_command_output(&repository_path, ["rev-parse", "feature"])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_creates_merge_commit_without_opening_editor(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        commit_file(&repository_path, "feature.txt", "feature\n", "feature");
+        git_command(&repository_path, ["switch", "main"]);
+        commit_file(&repository_path, "main.txt", "main\n", "main");
+        let main_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .merge(
+                "feature".to_string(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Merged);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD^1"]),
+            main_head
+        );
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD^2"]),
+            git_command_output(&repository_path, ["rev-parse", "feature"])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_already_up_to_date(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["branch", "feature"]);
+        commit_file(&repository_path, "main.txt", "main\n", "main");
+        let main_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .merge(
+                "feature".to_string(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD"]),
+            main_head
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_conflict_can_be_aborted(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        commit_file(&repository_path, "file.txt", "feature\n", "feature");
+        git_command(&repository_path, ["switch", "main"]);
+        commit_file(&repository_path, "file.txt", "main\n", "main");
+        let main_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .merge(
+                "feature".to_string(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Conflicts);
+        let git = repository.git_binary_in_worktree().unwrap();
+        assert!(ref_exists(&git, "MERGE_HEAD").await);
+
+        repository
+            .abort_operation(InProgressOperation::Merge, operation_envs())
+            .await
+            .unwrap();
+
+        assert!(!ref_exists(&git, "MERGE_HEAD").await);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD"]),
+            main_head
+        );
+        assert_eq!(
+            fs::read_to_string(repository_path.join("file.txt")).unwrap(),
+            "main\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cherry_pick_applies_commit_and_keeps_author(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        fs::write(repository_path.join("feature.txt"), "feature\n").unwrap();
+        git_command(&repository_path, ["add", "feature.txt"]);
+        git_command(
+            &repository_path,
+            [
+                "commit",
+                "-m",
+                "feature",
+                "--author",
+                "Original Author <original@zed.dev>",
+            ],
+        );
+        let feature_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+        git_command(&repository_path, ["switch", "main"]);
+        commit_file(&repository_path, "main.txt", "main\n", "main");
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .cherry_pick(
+                feature_head,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CherryPickOutcome::Applied);
+        assert_eq!(
+            fs::read_to_string(repository_path.join("feature.txt")).unwrap(),
+            "feature\n"
+        );
+        assert_eq!(
+            git_command_output(&repository_path, ["log", "-1", "--format=%an <%ae>"]),
+            "Original Author <original@zed.dev>"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cherry_pick_conflict_is_completed_by_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        fs::write(repository_path.join("file.txt"), "feature\n").unwrap();
+        git_command(&repository_path, ["add", "file.txt"]);
+        git_command(
+            &repository_path,
+            [
+                "commit",
+                "-m",
+                "feature change",
+                "--author",
+                "Original Author <original@zed.dev>",
+            ],
+        );
+        let feature_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+        git_command(&repository_path, ["switch", "main"]);
+        commit_file(&repository_path, "file.txt", "main\n", "main");
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .cherry_pick(
+                feature_head,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CherryPickOutcome::Conflicts);
+        let git = repository.git_binary_in_worktree().unwrap();
+        assert!(ref_exists(&git, "CHERRY_PICK_HEAD").await);
+
+        fs::write(repository_path.join("file.txt"), "resolved\n").unwrap();
+        git_command(&repository_path, ["add", "file.txt"]);
+        let message = repository.merge_message().await.unwrap();
+        repository
+            .commit(
+                message.into(),
+                None,
+                CommitOptions::default(),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!ref_exists(&git, "CHERRY_PICK_HEAD").await);
+        assert_eq!(
+            git_command_output(&repository_path, ["log", "-1", "--format=%an <%ae>|%s"]),
+            "Original Author <original@zed.dev>|feature change"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cherry_pick_of_commit_already_in_branch(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        let initial_commit = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+        commit_file(&repository_path, "main.txt", "main\n", "main");
+        let main_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .cherry_pick(
+                initial_commit,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CherryPickOutcome::AlreadyApplied);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD"]),
+            main_head
+        );
+    }
+
+    #[gpui::test]
+    async fn test_empty_cherry_pick_is_aborted(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repository_path = temp_dir.path().join("repo");
+        init_repository_with_main_commit(&repository_path);
+        git_command(&repository_path, ["switch", "-c", "feature"]);
+        commit_file(&repository_path, "file.txt", "same change\n", "feature");
+        let feature_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+        git_command(&repository_path, ["switch", "main"]);
+        commit_file(&repository_path, "file.txt", "same change\n", "main");
+        let main_head = git_command_output(&repository_path, ["rev-parse", "HEAD"]);
+
+        let repository = open_real_repository(&repository_path, cx);
+        let outcome = repository
+            .cherry_pick(
+                feature_head,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                operation_envs(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CherryPickOutcome::AlreadyApplied);
+        let git = repository.git_binary_in_worktree().unwrap();
+        assert!(!ref_exists(&git, "CHERRY_PICK_HEAD").await);
+        assert_eq!(
+            git_command_output(&repository_path, ["rev-parse", "HEAD"]),
+            main_head
         );
     }
 }

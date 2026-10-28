@@ -1,4 +1,5 @@
 mod dispatcher;
+mod display_connection;
 mod headless;
 mod keyboard;
 mod platform;
@@ -14,6 +15,7 @@ mod x11;
 mod xdg_desktop_portal;
 
 pub use dispatcher::*;
+pub(crate) use display_connection::{Backend, DisplayConnection, select_backend};
 pub(crate) use headless::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
@@ -26,35 +28,31 @@ pub(crate) use x11::*;
 
 use std::rc::Rc;
 
+use gpui::{GraphicalEnvironment, WindowingModes};
+
 /// Returns the default platform implementation for the current OS.
+///
+/// A windowed platform connects to the display server the process environment names, or starts
+/// headless when it names none, and can switch between those modes later. A headless platform
+/// stays headless.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
-    #[cfg(feature = "x11")]
-    use anyhow::Context as _;
-
-    if headless {
-        return Rc::new(LinuxPlatform {
-            inner: HeadlessClient::new(),
-        });
+    if headless || std::env::var_os("ZED_HEADLESS").is_some() {
+        linux_platform(WindowingModes::HEADLESS, None)
+    } else {
+        linux_platform(WindowingModes::all(), Some(GraphicalEnvironment::detect()))
     }
+}
 
-    match gpui::guess_compositor() {
-        #[cfg(feature = "wayland")]
-        "Wayland" => Rc::new(LinuxPlatform {
-            inner: WaylandClient::new(),
-        }),
-
-        #[cfg(feature = "x11")]
-        "X11" => Rc::new(LinuxPlatform {
-            inner: X11Client::new()
-                .context("Failed to initialize X11 client.")
-                .unwrap(),
-        }),
-
-        "Headless" => Rc::new(LinuxPlatform {
-            inner: HeadlessClient::new(),
-        }),
-        _ => unreachable!(
-            r#"At least one of the "wayland" or "x11" features must be enabled on gpui_linux or gpui_platform."#
-        ),
-    }
+/// Returns a platform that may switch among `allowed_modes`. It starts connected to the display
+/// server `graphical_environment` names, or headless when that's `None` or names none.
+///
+/// # Panics
+///
+/// Panics if `allowed_modes` doesn't allow the starting mode, or if the display server can't be
+/// reached.
+pub fn linux_platform(
+    allowed_modes: WindowingModes,
+    graphical_environment: Option<GraphicalEnvironment>,
+) -> Rc<dyn gpui::Platform> {
+    Rc::new(LinuxPlatform::new(allowed_modes, graphical_environment))
 }

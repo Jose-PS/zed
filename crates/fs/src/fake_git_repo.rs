@@ -12,11 +12,11 @@ use git::{
     Oid, RunHook,
     blame::Blame,
     repository::{
-        AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
-        commit_hash_search_query,
+        AskPassDelegate, Branch, CherryPickOutcome, CommitData, CommitDataReader, CommitDetails,
+        CommitOptions, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InProgressOperation,
+        InitialGraphCommitData, LogOrder, LogSource, MergeOutcome, PushOptions, RefEdit, Remote,
+        RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
     },
     stash::GitStash,
     status::{
@@ -79,10 +79,14 @@ pub struct FakeGitRepositoryState {
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
+    pub graph_commits_by_branch: HashMap<String, Vec<Arc<InitialGraphCommitData>>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub merged_branches: Vec<String>,
+    pub cherry_picked_commits: Vec<String>,
+    pub simulated_operation_conflict: bool,
 }
 
 impl FakeGitRepositoryState {
@@ -107,10 +111,14 @@ impl FakeGitRepositoryState {
             oids: Default::default(),
             remotes: HashMap::default(),
             graph_commits: Vec::new(),
+            graph_commits_by_branch: HashMap::default(),
             commit_data: Default::default(),
             commit_history: Vec::new(),
             stash_entries: Default::default(),
             commit_template: None,
+            merged_branches: Vec::new(),
+            cherry_picked_commits: Vec::new(),
+            simulated_operation_conflict: false,
         }
     }
 }
@@ -1239,6 +1247,64 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn merge(
+        &self,
+        branch: String,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<MergeOutcome>> {
+        self.with_state_async(true, move |state| {
+            if !state.branches.contains(&branch) {
+                bail!("merge: {branch} - not something we can merge");
+            }
+            state.merged_branches.push(branch.clone());
+            if state.simulated_operation_conflict {
+                state.refs.insert("MERGE_HEAD".into(), branch);
+                return Ok(MergeOutcome::Conflicts);
+            }
+            let new_sha = format!("fake-merge-{}", state.merged_branches.len());
+            state.refs.insert("HEAD".into(), new_sha);
+            Ok(MergeOutcome::Merged)
+        })
+    }
+
+    fn cherry_pick(
+        &self,
+        commit: String,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<CherryPickOutcome>> {
+        self.with_state_async(true, move |state| {
+            state.cherry_picked_commits.push(commit.clone());
+            if state.simulated_operation_conflict {
+                state.refs.insert("CHERRY_PICK_HEAD".into(), commit);
+                return Ok(CherryPickOutcome::Conflicts);
+            }
+            let new_sha = format!("fake-cherry-pick-{}", state.cherry_picked_commits.len());
+            state.refs.insert("HEAD".into(), new_sha);
+            Ok(CherryPickOutcome::Applied)
+        })
+    }
+
+    fn abort_operation(
+        &self,
+        operation: InProgressOperation,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.with_state_async(true, move |state| {
+            let head_ref = match operation {
+                InProgressOperation::Merge => "MERGE_HEAD",
+                InProgressOperation::CherryPick => "CHERRY_PICK_HEAD",
+                InProgressOperation::Revert => "REVERT_HEAD",
+                InProgressOperation::Rebase => "REBASE_HEAD",
+            };
+            if state.refs.remove(head_ref).is_none() {
+                bail!("fatal: no {} in progress", operation.subcommand());
+            }
+            Ok(())
+        })
+    }
+
     fn run_hook(
         &self,
         _hook: RunHook,
@@ -1640,7 +1706,7 @@ impl GitRepository for FakeGitRepository {
 
     fn initial_graph_data(
         &self,
-        _log_source: LogSource,
+        log_source: LogSource,
         _log_order: LogOrder,
         request_tx: Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1649,8 +1715,14 @@ impl GitRepository for FakeGitRepository {
         async move {
             let (graph_commits, simulated_error) =
                 fs.with_git_state(&dot_git_path, false, |state| {
+                    let branch_commits = match &log_source {
+                        LogSource::Branch(branch) => {
+                            state.graph_commits_by_branch.get(branch.as_ref()).cloned()
+                        }
+                        LogSource::All | LogSource::Sha(_) | LogSource::Path(_) => None,
+                    };
                     (
-                        state.graph_commits.clone(),
+                        branch_commits.unwrap_or_else(|| state.graph_commits.clone()),
                         state.simulated_graph_error.clone(),
                     )
                 })?;

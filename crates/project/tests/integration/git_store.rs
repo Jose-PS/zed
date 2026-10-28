@@ -5,7 +5,7 @@ mod conflict_set_tests {
 
     use fs::FakeFs;
     use git::{
-        repository::{RepoPath, repo_path},
+        repository::{InProgressOperation, RepoPath, repo_path},
         status::{UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::{BackgroundExecutor, TestAppContext};
@@ -666,6 +666,57 @@ mod conflict_set_tests {
             assert!(!conflict_set.has_conflict);
             assert_eq!(conflict_set.snapshot.conflicts.len(), 0);
         });
+    }
+
+    #[gpui::test]
+    async fn test_in_progress_operation_follows_operation_heads(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        zlog::init_test();
+        cx.update(|cx| {
+            settings::init(cx);
+        });
+        let fs = FakeFs::new(executor);
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project should have an active repository");
+        let in_progress = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress)
+        };
+        assert_eq!(in_progress(cx), None);
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.insert("CHERRY_PICK_HEAD".into(), "abc".into());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), Some(InProgressOperation::CherryPick));
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.remove("CHERRY_PICK_HEAD");
+            state.refs.insert("MERGE_HEAD".into(), "def".into());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), Some(InProgressOperation::Merge));
+
+        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
+            state.refs.remove("MERGE_HEAD");
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(in_progress(cx), None);
     }
 }
 
@@ -2575,5 +2626,168 @@ mod repository_activation_tests {
                 });
             });
         });
+    }
+}
+
+mod git_operation_tests {
+    use askpass::AskPassDelegate;
+    use fs::FakeFs;
+    use git::{
+        repository::{CherryPickOutcome, InProgressOperation, MergeOutcome},
+        status::StatusCode,
+    };
+    use gpui::{BackgroundExecutor, Entity, TestAppContext};
+    use project::{Project, git_store::Repository};
+    use serde_json::json;
+    use std::{path::Path, sync::Arc};
+    use util::path;
+
+    async fn init_project(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeFs>, Entity<Project>, Entity<Repository>) {
+        zlog::init_test();
+        cx.update(|cx| {
+            settings::init(cx);
+        });
+        let fs = FakeFs::new(executor);
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\n",
+            }),
+        )
+        .await;
+        let dot_git = Path::new(path!("/project/.git"));
+        fs.set_head_and_index_for_repo(dot_git, &[("a.txt", "one\n".to_string())]);
+        fs.set_branch_name(dot_git, Some("main"));
+        fs.insert_branches(dot_git, &["main", "feature"]);
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project should have an active repository");
+        (fs, project, repository)
+    }
+
+    fn test_askpass(cx: &mut TestAppContext) -> AskPassDelegate {
+        AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {})
+    }
+
+    #[gpui::test]
+    async fn test_merge_runs_on_clean_repository(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, _project, repository) = init_project(executor, cx).await;
+
+        let askpass = test_askpass(cx);
+        let outcome = repository
+            .update(cx, |repository, cx| {
+                repository.merge("feature".to_string(), askpass, cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Merged);
+        let merged_branches = fs
+            .with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                state.merged_branches.clone()
+            })
+            .unwrap();
+        assert_eq!(merged_branches, vec!["feature".to_string()]);
+    }
+
+    #[gpui::test]
+    async fn test_operations_are_rejected_with_uncommitted_changes(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, _project, repository) = init_project(executor, cx).await;
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", StatusCode::Modified.worktree())],
+        );
+        cx.run_until_parked();
+
+        let askpass = test_askpass(cx);
+        let merge_result = repository
+            .update(cx, |repository, cx| {
+                repository.merge("feature".to_string(), askpass, cx)
+            })
+            .await
+            .unwrap();
+        assert!(merge_result.is_err());
+
+        let askpass = test_askpass(cx);
+        let cherry_pick_result = repository
+            .update(cx, |repository, cx| {
+                repository.cherry_pick("abc".to_string(), askpass, cx)
+            })
+            .await
+            .unwrap();
+        assert!(cherry_pick_result.is_err());
+
+        let (merged_branches, cherry_picked_commits) = fs
+            .with_git_state(Path::new(path!("/project/.git")), false, |state| {
+                (
+                    state.merged_branches.clone(),
+                    state.cherry_picked_commits.clone(),
+                )
+            })
+            .unwrap();
+        assert!(merged_branches.is_empty());
+        assert!(cherry_picked_commits.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_cherry_pick_conflict_can_be_aborted(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, _project, repository) = init_project(executor, cx).await;
+        fs.with_git_state(Path::new(path!("/project/.git")), true, |state| {
+            state.simulated_operation_conflict = true;
+        })
+        .unwrap();
+
+        let askpass = test_askpass(cx);
+        let outcome = repository
+            .update(cx, |repository, cx| {
+                repository.cherry_pick("abc".to_string(), askpass, cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, CherryPickOutcome::Conflicts);
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress),
+            Some(InProgressOperation::CherryPick)
+        );
+
+        let askpass = test_askpass(cx);
+        let second_result = repository
+            .update(cx, |repository, cx| {
+                repository.merge("feature".to_string(), askpass, cx)
+            })
+            .await
+            .unwrap();
+        assert!(second_result.is_err());
+
+        repository
+            .update(cx, |repository, _| {
+                repository.abort_operation(InProgressOperation::CherryPick)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress),
+            None
+        );
     }
 }

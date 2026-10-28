@@ -22,7 +22,10 @@ use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs};
 use git::{
     Oid,
-    repository::{CommitData, GitCommitTemplate, RepoPath, Worktree as GitWorktree},
+    repository::{
+        CherryPickOutcome, CommitData, GitCommitTemplate, InProgressOperation, MergeOutcome,
+        RepoPath, Worktree as GitWorktree,
+    },
 };
 use gpui::{
     AppContext as _, Entity, ImageSource, IntoElement as _, SharedString, TestAppContext,
@@ -4211,6 +4214,99 @@ async fn test_remote_git_branches(cx: &mut TestAppContext, server_cx: &mut TestA
         .unwrap()
         .unwrap();
     assert_eq!(default_branch_with_remote.as_deref(), Some("origin/main"));
+}
+
+#[gpui::test]
+async fn test_remote_git_merge_and_cherry_pick(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code"),
+        json!({
+            "project1": {
+                ".git": {},
+                "README.md": "# project 1",
+            },
+        }),
+    )
+    .await;
+    let dot_git = Path::new(path!("/code/project1/.git"));
+    fs.set_head_and_index_for_repo(dot_git, &[("README.md", "# project 1".to_string())]);
+    fs.set_branch_name(dot_git, Some("main"));
+    fs.insert_branches(dot_git, &["main", "dev"]);
+
+    let (project, _headless_project) = init_test(&fs, cx, server_cx).await;
+    let (_worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    let repository = project.update(cx, |project, cx| project.active_repository(cx).unwrap());
+
+    let askpass = askpass::AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+    let merge_outcome = cx
+        .update(|cx| {
+            repository.update(cx, |repository, cx| {
+                repository.merge("dev".to_string(), askpass, cx)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merge_outcome, MergeOutcome::Merged);
+
+    fs.with_git_state(dot_git, true, |state| {
+        state.simulated_operation_conflict = true;
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let askpass = askpass::AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {});
+    let cherry_pick_outcome = cx
+        .update(|cx| {
+            repository.update(cx, |repository, cx| {
+                repository.cherry_pick("abc".to_string(), askpass, cx)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cherry_pick_outcome, CherryPickOutcome::Conflicts);
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress),
+        Some(InProgressOperation::CherryPick)
+    );
+
+    cx.update(|cx| {
+        repository.update(cx, |repository, _| {
+            repository.abort_operation(InProgressOperation::CherryPick)
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repository, _| repository.snapshot().merge.in_progress),
+        None
+    );
+
+    let (merged_branches, cherry_picked_commits) = fs
+        .with_git_state(dot_git, false, |state| {
+            (
+                state.merged_branches.clone(),
+                state.cherry_picked_commits.clone(),
+            )
+        })
+        .unwrap();
+    assert_eq!(merged_branches, vec!["dev".to_string()]);
+    assert_eq!(cherry_picked_commits, vec!["abc".to_string()]);
 }
 
 #[gpui::test]

@@ -46,6 +46,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+mod merge_operations;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -277,6 +278,14 @@ pub fn init(cx: &mut App) {
             };
             panel.update(cx, |panel, cx| {
                 panel.stash_pop(action, window, cx);
+            });
+        });
+        workspace.register_action(|workspace, action: &git::AbortOperation, window, cx| {
+            let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.abort_operation(action, window, cx);
             });
         });
         workspace.register_action(|workspace, action: &git::StashApply, window, cx| {
