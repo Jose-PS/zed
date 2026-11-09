@@ -39,7 +39,7 @@ use gpui::{
     Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
     ForegroundExecutor, GraphicalEnvironment, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions,
     Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
+    PlatformWindow, PowerMode, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
     WindowButtonLayout, WindowParams, WindowingModes, WindowingRequest,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -71,10 +71,11 @@ pub(crate) struct PlatformHandlers {
     pub(crate) keyboard_layout_change: Option<Box<dyn FnMut()>>,
     pub(crate) system_sleep: Option<Box<dyn FnMut()>>,
     pub(crate) system_wake: Option<Box<dyn FnMut()>>,
+    pub(crate) power_mode_change: Option<Box<dyn FnMut()>>,
+    pub(crate) displays_changed: Option<Box<dyn FnMut()>>,
 }
 
-/// A logind `PrepareForSleep` signal, forwarded from the D-Bus listener to
-/// the client's event loop.
+/// A system power change, forwarded from D-Bus to the client's event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
@@ -83,6 +84,7 @@ pub(crate) struct PlatformHandlers {
 pub(crate) enum SystemPowerEvent {
     Sleep,
     Wake,
+    ModeChanged(PowerMode),
 }
 
 pub(crate) struct LinuxCommon {
@@ -103,6 +105,9 @@ pub(crate) struct LinuxCommon {
     )]
     power_sender: Sender<SystemPowerEvent>,
     power_listener_started: bool,
+    power_mode: PowerMode,
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    power_mode_listener: Option<Task<()>>,
     /// Runs after each foreground runnable registered by [`LinuxCommon::register_sources`].
     ///
     /// X11 uses this to handle events that a runnable's requests read into xcb's queue, where
@@ -147,6 +152,9 @@ impl LinuxCommon {
             ),
             power_sender,
             power_listener_started: false,
+            power_mode: PowerMode::Unknown,
+            #[cfg(any(feature = "wayland", feature = "x11"))]
+            power_mode_listener: None,
             after_runnable: None,
         };
 
@@ -215,9 +223,16 @@ impl LinuxCommon {
         Ok(())
     }
 
-    /// Runs the app's sleep or wake callback, without `common` borrowed, since the callback
+    /// Runs the app's power callback, without `common` borrowed, since the callback
     /// can call back into the platform.
     fn handle_system_power_event(common: &RefCell<Self>, event: SystemPowerEvent) {
+        if let SystemPowerEvent::ModeChanged(mode) = event {
+            let mut common = common.borrow_mut();
+            if common.power_mode == mode {
+                return;
+            }
+            common.power_mode = mode;
+        }
         fn slot(
             callbacks: &mut PlatformHandlers,
             event: SystemPowerEvent,
@@ -225,6 +240,7 @@ impl LinuxCommon {
             match event {
                 SystemPowerEvent::Sleep => &mut callbacks.system_sleep,
                 SystemPowerEvent::Wake => &mut callbacks.system_wake,
+                SystemPowerEvent::ModeChanged(_) => &mut callbacks.power_mode_change,
             }
         }
         let callback = slot(&mut common.borrow_mut().callbacks, event).take();
@@ -280,6 +296,11 @@ pub(crate) struct LinuxPlatform {
     loop_handle: LoopHandle<'static, ()>,
     connection: RefCell<DisplayConnection>,
     allowed_modes: WindowingModes,
+    /// The mode to start in, applied when `run` starts. Windowed in the process's own
+    /// environment when unset.
+    initial_windowing: RefCell<Option<WindowingRequest>>,
+    /// Taken by the connection made when `run` starts.
+    startup_environment: RefCell<Option<StartupEnvironment>>,
     /// A requested switch waiting for the event loop to apply it.
     pending_mode: RefCell<Option<WindowingRequest>>,
     transition_waiter: RefCell<Option<oneshot::Sender<anyhow::Result<()>>>>,
@@ -300,18 +321,8 @@ struct StartupEnvironment {
 }
 
 impl LinuxPlatform {
-    /// Creates the platform, connected to the display server `graphical_environment` names, or
-    /// headless.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `allowed_modes` doesn't allow the starting mode, or if the display server can't
-    /// be reached, because platform construction is infallible. An environment that names no
-    /// allowed display server starts headless when `allowed_modes` allows it.
-    pub(crate) fn new(
-        allowed_modes: WindowingModes,
-        graphical_environment: Option<GraphicalEnvironment>,
-    ) -> Self {
+    /// Creates the platform, headless until `run` connects it in its initial mode.
+    pub(crate) fn new(allowed_modes: WindowingModes) -> Self {
         let startup = StartupEnvironment {
             #[cfg(feature = "wayland")]
             activation_token: crate::linux::take_startup_activation_token_from_environment(),
@@ -324,33 +335,58 @@ impl LinuxPlatform {
         let loop_handle = event_loop.handle();
         LinuxCommon::register_sources(&common, &loop_handle, main_receiver, power_receiver)
             .expect("failed to register Linux event sources");
-        let platform = Self {
+        Self {
             common,
             event_loop: RefCell::new(Some(event_loop)),
             loop_handle,
             connection: RefCell::new(DisplayConnection::Headless(HeadlessConnection::new())),
             allowed_modes,
+            initial_windowing: RefCell::new(None),
+            startup_environment: RefCell::new(Some(startup)),
             pending_mode: RefCell::new(None),
             transition_waiter: RefCell::new(None),
-        };
+        }
+    }
 
-        let backend = graphical_environment.as_ref().and_then(|environment| {
-            Some((select_backend(allowed_modes, environment)?, environment))
-        });
+    /// Connects in the initial mode, before the app finishes launching.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the allowed modes don't allow the initial mode, or if its display server can't
+    /// be reached, since the app can't start. A windowed initial mode whose environment names no
+    /// allowed display server starts headless when that's allowed.
+    fn connect_initially(&self) {
+        let request = self
+            .initial_windowing
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| WindowingRequest::Windowed(GraphicalEnvironment::detect()));
+        // Dropped unused when starting headless, closing any inherited `WAYLAND_SOCKET`.
+        let startup = self
+            .startup_environment
+            .borrow_mut()
+            .take()
+            .unwrap_or_default();
+        let backend = match &request {
+            WindowingRequest::Headless => None,
+            WindowingRequest::Windowed(environment) => {
+                select_backend(self.allowed_modes, environment)
+                    .map(|backend| (backend, environment))
+            }
+        };
         match backend {
             Some((backend, environment)) => {
-                let connection = platform
+                let connection = self
                     .connect(backend, environment, startup)
                     .unwrap_or_else(|error| panic!("{error:#}"));
-                platform.replace_connection(connection);
+                self.replace_connection(connection);
             }
             None => assert!(
-                allowed_modes.contains(WindowingModes::HEADLESS),
-                "{allowed_modes:?} does not allow starting headless, and no allowed display \
-                 server was given"
+                self.allowed_modes.contains(WindowingModes::HEADLESS),
+                "{:?} does not allow starting headless, and no allowed display server was given",
+                self.allowed_modes
             ),
         }
-        platform
     }
 
     fn with_common<R>(&self, function: impl FnOnce(&mut LinuxCommon) -> R) -> R {
@@ -407,6 +443,31 @@ impl LinuxPlatform {
     fn replace_connection(&self, connection: DisplayConnection) {
         let previous = std::mem::replace(&mut *self.connection.borrow_mut(), connection);
         drop(previous);
+        // The app caches the keyboard layout and the displays, which belong to
+        // the connection.
+        let callback = self
+            .common
+            .borrow_mut()
+            .callbacks
+            .keyboard_layout_change
+            .take();
+        if let Some(mut callback) = callback {
+            callback();
+            let mut common = self.common.borrow_mut();
+            // The callback may have replaced itself.
+            if common.callbacks.keyboard_layout_change.is_none() {
+                common.callbacks.keyboard_layout_change = Some(callback);
+            }
+        }
+        let callback = self.common.borrow_mut().callbacks.displays_changed.take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.common
+                .borrow_mut()
+                .callbacks
+                .displays_changed
+                .get_or_insert(callback);
+        }
     }
 
     /// Applies a pending switch.
@@ -478,13 +539,6 @@ impl LinuxPlatform {
                 }
             }
         }
-        // A window belongs to the connection that opened it, so it can't survive a switch.
-        if self.connection.borrow().has_windows() {
-            return Task::ready(Err(anyhow!(
-                "cannot switch display modes while windows are open"
-            )));
-        }
-
         let (sender, receiver) = oneshot::channel();
         self.transition_waiter.borrow_mut().replace(sender);
         *self.pending_mode.borrow_mut() = Some(mode);
@@ -509,6 +563,17 @@ impl Drop for LinuxPlatform {
 }
 
 impl Platform for LinuxPlatform {
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        gpui::PlatformInfo {
+            os: if cfg!(target_os = "freebsd") {
+                gpui::OperatingSystem::FreeBsd
+            } else {
+                gpui::OperatingSystem::Linux
+            },
+            target: gpui::PlatformTarget::Native,
+        }
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.with_common(|common| common.background_executor.clone())
     }
@@ -539,6 +604,34 @@ impl Platform for LinuxPlatform {
         ThermalState::Nominal
     }
 
+    fn power_mode(&self) -> PowerMode {
+        self.with_common(|common| common.power_mode)
+    }
+
+    fn on_power_mode_change(&self, callback: Box<dyn FnMut()>) {
+        self.with_common(|common| {
+            common.callbacks.power_mode_change = Some(callback);
+            #[cfg(any(feature = "wayland", feature = "x11"))]
+            if common.power_mode_listener.is_none() {
+                let sender = common.power_sender.clone();
+                common.power_mode_listener = Some(common.background_executor.spawn(async move {
+                    let result = async {
+                        let connection = ashpd::zbus::Connection::system().await?;
+                        crate::linux::power::monitor_power_mode(&connection, |mode| {
+                            sender.send(SystemPowerEvent::ModeChanged(mode))?;
+                            Ok(())
+                        })
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        log::debug!("failed to monitor system power mode: {error:?}");
+                    }
+                }));
+            }
+        });
+    }
+
     #[cfg(not(any(feature = "wayland", feature = "x11")))]
     fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
         Task::ready(Err(anyhow!(
@@ -567,6 +660,7 @@ impl Platform for LinuxPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        self.connect_initially();
         on_finish_launching();
 
         let mut event_loop = self
@@ -588,6 +682,10 @@ impl Platform for LinuxPlatform {
 
     fn quit(&self) {
         self.with_common(|common| common.signal.stop());
+    }
+
+    fn set_initial_windowing(&self, request: WindowingRequest) {
+        *self.initial_windowing.borrow_mut() = Some(request);
     }
 
     fn request_windowing(&self, request: WindowingRequest) -> Task<anyhow::Result<()>> {
@@ -676,6 +774,10 @@ impl Platform for LinuxPlatform {
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         self.connection.borrow().displays()
+    }
+
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        self.with_common(|common| common.callbacks.displays_changed = Some(callback));
     }
 
     #[cfg(feature = "screen-capture")]
@@ -1655,6 +1757,43 @@ mod tests {
     use super::*;
     use gpui::{Point, px};
 
+    #[test]
+    fn power_mode_callbacks_can_reenter_and_replace_themselves() -> anyhow::Result<()> {
+        let event_loop = EventLoop::<()>::try_new()?;
+        let (common, _, _) = LinuxCommon::new(event_loop.get_signal());
+        let common = Rc::new(RefCell::new(common));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        common.borrow_mut().callbacks.power_mode_change = Some(Box::new({
+            let common = Rc::downgrade(&common);
+            let calls = calls.clone();
+            move || {
+                let common = common.upgrade().expect("common is alive");
+                calls.borrow_mut().push((common.borrow().power_mode, false));
+                common.borrow_mut().callbacks.power_mode_change = Some(Box::new({
+                    let common = Rc::downgrade(&common);
+                    let calls = calls.clone();
+                    move || {
+                        let common = common.upgrade().expect("common is alive");
+                        calls.borrow_mut().push((common.borrow().power_mode, true));
+                    }
+                }));
+            }
+        }));
+        // Repeated reports of the same mode must not invoke the callback again.
+        for mode in [
+            PowerMode::LowPower,
+            PowerMode::LowPower,
+            PowerMode::Balanced,
+        ] {
+            LinuxCommon::handle_system_power_event(&common, SystemPowerEvent::ModeChanged(mode));
+        }
+        assert_eq!(
+            *calls.borrow(),
+            [(PowerMode::LowPower, false), (PowerMode::Balanced, true)]
+        );
+        Ok(())
+    }
+
     #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]
     fn rejects_null_xkb_context() {
@@ -2018,7 +2157,8 @@ mod display_mode_tests {
     /// socket that doesn't exist.
     fn run_scenario(name: &str, modes: WindowingModes, scenario: Scenario) {
         if std::env::var(SCENARIO_ENV).as_deref() == Ok(name) {
-            let platform = Rc::new(LinuxPlatform::new(modes, None));
+            let platform = Rc::new(LinuxPlatform::new(modes));
+            platform.set_initial_windowing(WindowingRequest::Headless);
             let completed = Rc::new(Cell::new(false));
             Application::with_platform(platform)
                 .with_quit_mode(QuitMode::Explicit)
