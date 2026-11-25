@@ -6,8 +6,9 @@ use super::{
     ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
     drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
     handle_elicitation, handle_v2_complete_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
-    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    mcp_configurations_for_project, opencode_child_sessions, respond_err, respond_result, runtime,
+    session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -515,12 +516,38 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |message: agent_client_protocol::UntypedMessage,
+                            connection: ConnectionTo<Agent>| {
+                    let parsed = opencode_child_sessions::parse_child_update_notification(
+                        message, connection,
+                    )?;
+                    Ok(opencode_child_sessions::into_untyped_handled(
+                        parsed,
+                        |notification| {
+                            enqueue_notification(
+                                &dispatch_sender,
+                                notification,
+                                handle_opencode_child_update,
+                            );
+                        },
+                    ))
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        (
+            opencode_child_sessions::CHILD_SESSION_UPDATES_META_KEY.into(),
+            true.into(),
+        ),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -10185,6 +10212,495 @@ exit 7
         cx.update(|_| ());
         cx.run_until_parked();
     }
+
+    async fn setup_opencode_fake_session(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Rc<AcpConnection>,
+        ConnectionTo<Client>,
+        Entity<AcpThread>,
+        acp_v2::SessionId,
+        Task<anyhow::Result<()>>,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let root_session_id = acp_v2::SessionId::new("ses_dedaa8fbbffezxNazXc3aFaRK5");
+        let root_thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    root_session_id.clone(),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load root session");
+        cx.run_until_parked();
+        (
+            connection,
+            agent,
+            root_thread,
+            root_session_id,
+            keep_agent_alive,
+        )
+    }
+
+    fn send_opencode_child_update(
+        agent: &ConnectionTo<Client>,
+        params: serde_json::Value,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let notification = agent_client_protocol::UntypedMessage::new(
+            opencode_child_sessions::CHILD_UPDATE_METHOD,
+            params,
+        )
+        .expect("untyped child update notification");
+        agent
+            .send_notification(notification)
+            .expect("send child update notification");
+        drain_sdk_background_tasks(cx);
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn test_opencode_child_session_updates_capability_is_advertised() {
+        for agent_id in ["opencode", "claude-code", "cursor"] {
+            let capabilities = client_capabilities_for_agent(&AgentId::new(agent_id));
+            let meta = capabilities.meta.expect("client capabilities meta");
+            assert_eq!(
+                meta.get(opencode_child_sessions::CHILD_SESSION_UPDATES_META_KEY),
+                Some(&serde_json::Value::Bool(true)),
+                "capability meta must be advertised for {agent_id}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_opencode_child_status_lifecycle(cx: &mut gpui::TestAppContext) {
+        use acp_thread::ThreadStatus;
+
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_dedaa7fadffeBykxPWivzK9Iyt";
+        let child_title = "Listar y resumir ficheros";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            assert_eq!(root.subagents().count(), 1);
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("created child subagent")
+        });
+        child_thread.read_with(cx, |child, _| {
+            assert_eq!(
+                child
+                    .subagent_association()
+                    .and_then(|association| association.title.as_deref()),
+                Some(child_title)
+            );
+            assert_eq!(child.status(), ThreadStatus::Generating);
+        });
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "running"
+            }),
+            cx,
+        );
+        root_thread.read_with(cx, |root, _| {
+            assert_eq!(root.subagents().count(), 1);
+        });
+        child_thread.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Generating);
+        });
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "completed"
+            }),
+            cx,
+        );
+        child_thread.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Idle);
+        });
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "running"
+            }),
+            cx,
+        );
+        child_thread.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Generating);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opencode_child_update_routes_to_child_and_strips_title_prefix(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_dedaa7fadffeBykxPWivzK9Iyt";
+        let child_title = "Listar y resumir ficheros";
+        let tool_call_id = "ses_dedaa7fadffeBykxPWivzK9Iyt:toolu_01GmRuq3xM1NVd7w2QctHDmJ";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "update",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_call_id,
+                    "name": "glob",
+                    "title": "Listar y resumir ficheros: glob",
+                    "kind": "search",
+                    "status": "pending",
+                    "locations": [],
+                    "rawInput": {},
+                    "_meta": {
+                        "opencode/child-session": {
+                            "id": child_id,
+                            "parentID": root_session_id.0,
+                            "depth": 1,
+                            "title": child_title
+                        }
+                    }
+                }
+            }),
+            cx,
+        );
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "update",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_call_id,
+                    "status": "in_progress",
+                    "kind": "search",
+                    "title": "Listar y resumir ficheros: glob /a",
+                    "locations": [{"path": "/a"}],
+                    "rawInput": {"pattern": "**/*", "path": "/a"},
+                    "_meta": {
+                        "opencode/child-session": {
+                            "id": child_id,
+                            "parentID": root_session_id.0,
+                            "depth": 1,
+                            "title": child_title
+                        }
+                    }
+                }
+            }),
+            cx,
+        );
+
+        root_thread.read_with(cx, |root, _| {
+            assert!(root.entries().is_empty());
+        });
+
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("child subagent")
+        });
+        child_thread.read_with(cx, |child, cx| {
+            let [acp_thread::AgentThreadEntry::ToolCall(tool_call)] = child.entries() else {
+                panic!("expected one tool call in child thread");
+            };
+            assert_eq!(tool_call.id, acp_v2::ToolCallId::new(tool_call_id));
+            assert_eq!(tool_call.label.read(cx).source(), "glob /a");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opencode_child_update_without_prior_status_creates_subagent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use acp_thread::ThreadStatus;
+
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_dedaa7fadffeBykxPWivzK9Iyt";
+        let child_title = "Listar y resumir ficheros";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "update",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "msg_212558f30001eORot3Fuc79yPz",
+                    "content": {
+                        "type": "text",
+                        "text": "Resumen de prueba"
+                    },
+                    "_meta": {
+                        "opencode/child-session": {
+                            "id": child_id,
+                            "parentID": root_session_id.0,
+                            "depth": 1,
+                            "title": child_title
+                        }
+                    }
+                }
+            }),
+            cx,
+        );
+
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            assert!(root.entries().is_empty());
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("created child subagent on update")
+        });
+        child_thread.read_with(cx, |child, _| {
+            assert_eq!(child.status(), ThreadStatus::Generating);
+            assert_eq!(child.entries().len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opencode_child_depth_two_registers_under_parent_child(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_child_depth_1";
+        let grandchild_id = "ses_child_depth_2";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": "Hijo nivel 1",
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": grandchild_id,
+                "parentSessionId": child_id,
+                "depth": 2,
+                "title": "Nieto nivel 2",
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            assert!(root.subagent(&grandchild_id.into()).is_none());
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("depth 1 child registered on root")
+        });
+        child_thread.read_with(cx, |child, cx| {
+            let grandchild = child
+                .subagent(&grandchild_id.into())
+                .expect("depth 2 grandchild registered on depth 1 child");
+            assert_eq!(
+                grandchild.read(cx).parent_session_id(),
+                Some(&acp_v2::SessionId::new(child_id))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opencode_child_permission_request_routes_to_child_thread(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_deda90fe2ffetxtlDXIE2MgDQQ";
+        let child_title = "Leer variables del .env";
+        let tool_call_id = "ses_deda90fe2ffetxtlDXIE2MgDQQ:toolu_01HBKzJGjb4PHXKu7YPz7apX";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": child_title,
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        let mut meta = acp::Meta::new();
+        meta.insert(
+            "opencode/child-session".into(),
+            serde_json::json!({
+                "id": child_id,
+                "parentID": root_session_id.0,
+                "depth": 1,
+                "title": child_title
+            }),
+        );
+        let permission_request = acp::RequestPermissionRequest::new(
+            acp::SessionId::new(root_session_id.0),
+            acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(tool_call_id),
+                acp::ToolCallUpdateFields::default()
+                    .title("Leer variables del .env: /a/.env")
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::Pending),
+            )
+            .meta(meta),
+            vec![acp::PermissionOption::new(
+                "once",
+                "Allow once",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        );
+
+        let _pending_response = agent.send_request(permission_request);
+        drain_sdk_background_tasks(cx);
+        cx.run_until_parked();
+
+        root_thread.read_with(cx, |root, _| {
+            assert_eq!(root.pending_permission_requests().count(), 0);
+            assert!(root.entries().is_empty());
+        });
+
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("child subagent")
+        });
+        child_thread.read_with(cx, |child, cx| {
+            assert_eq!(child.pending_permission_requests().count(), 1);
+            let [acp_thread::AgentThreadEntry::ToolCall(tool_call)] = child.entries() else {
+                panic!("expected tool call waiting for confirmation in child thread");
+            };
+            assert_eq!(tool_call.label.read(cx).source(), "/a/.env");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_opencode_parent_session_update_remains_on_parent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_connection, agent, root_thread, root_session_id, _keep_agent_alive) =
+            setup_opencode_fake_session(cx).await;
+        let child_id = "ses_dedaa7fadffeBykxPWivzK9Iyt";
+
+        send_opencode_child_update(
+            &agent,
+            serde_json::json!({
+                "rootSessionId": root_session_id.0,
+                "childSessionId": child_id,
+                "parentSessionId": root_session_id.0,
+                "depth": 1,
+                "title": "Listar y resumir ficheros",
+                "type": "status",
+                "status": "created"
+            }),
+            cx,
+        );
+
+        agent
+            .send_notification(acp::SessionNotification::new(
+                acp::SessionId::new(root_session_id.0),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "Mensaje del hilo principal".into(),
+                )),
+            ))
+            .expect("send parent session update");
+        drain_sdk_background_tasks(cx);
+        cx.run_until_parked();
+
+        root_thread.read_with(cx, |root, _| {
+            assert_eq!(root.entries().len(), 1);
+        });
+        let child_thread = root_thread.read_with(cx, |root, _| {
+            root.subagent(&child_id.into())
+                .cloned()
+                .expect("child subagent")
+        });
+        child_thread.read_with(cx, |child, _| {
+            assert!(child.entries().is_empty());
+        });
+    }
 }
 
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
@@ -10375,12 +10891,12 @@ fn permission_outcome_to_v1(
 }
 
 fn handle_request_permission(
-    args: acp::RequestPermissionRequest,
+    mut args: acp::RequestPermissionRequest,
     responder: Responder<acp::RequestPermissionResponse>,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
-    let thread = match session_thread(ctx, &acp_v2::SessionId::new(args.session_id.0)) {
+    let thread = match opencode_child_sessions::resolve_permission_target(&mut args, ctx, cx) {
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
     };
@@ -10560,6 +11076,19 @@ fn apply_v1_subagent_update(
         MaybeUndefined::Null => subagent.clear_session_state(cx),
         MaybeUndefined::Value(state) => subagent.update_session_state(state, cx),
     })
+}
+
+fn handle_opencode_child_update(
+    notification: opencode_child_sessions::ChildUpdateNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    opencode_child_sessions::handle_child_update_notification(
+        notification,
+        cx,
+        ctx,
+        handle_session_notification,
+    );
 }
 
 fn handle_session_notification(
