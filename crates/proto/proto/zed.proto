@@ -518,11 +518,20 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
-    GitMerge git_merge = 496;
-    GitMergeResponse git_merge_response = 497;
-    GitCherryPick git_cherry_pick = 498;
-    GitCherryPickResponse git_cherry_pick_response = 499;
-    GitAbortOperation git_abort_operation = 500; // current max
+    GetGlobalSkills get_global_skills = 496;
+    GetGlobalSkillsResponse get_global_skills_response = 497;
+    GlobalSkillsChanged global_skills_changed = 498;
+    CreateGlobalSkill create_global_skill = 499;
+    CreateGlobalSkillResponse create_global_skill_response = 500;
+    TrashGlobalSkill trash_global_skill = 501;
+    ResolveGlobalSkillPath resolve_global_skill_path = 502;
+    ResolveGlobalSkillPathResponse resolve_global_skill_path_response = 503;
+    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504;
+    GitMerge git_merge = 505;
+    GitMergeResponse git_merge_response = 506;
+    GitCherryPick git_cherry_pick = 507;
+    GitCherryPickResponse git_cherry_pick_response = 508;
+    GitAbortOperation git_abort_operation = 509; // current max
   }
 
   reserved 87 to 88;
