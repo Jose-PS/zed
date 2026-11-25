@@ -1,5 +1,6 @@
 mod auth_status;
 mod debug_log;
+mod opencode_child_sessions;
 mod runtime;
 mod session_updates;
 mod terminal_updates;
